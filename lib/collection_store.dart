@@ -8,6 +8,7 @@ class CollectionItem {
   // What the user chose on details screen
   final int userGrade; // 1..10
   final String? finish; // e.g. normal, holofoil, reverseHolofoil
+  final String? localPhotoPath; // user scan photo stored locally (optional)
 
   // Pricing snapshot at time of save
   final double? marketAtSave;
@@ -20,6 +21,7 @@ class CollectionItem {
     required this.addedAt,
     this.userGrade = 8,
     this.finish,
+    this.localPhotoPath,
     this.marketAtSave,
     this.highAtSave,
     this.estLowAtSave,
@@ -63,6 +65,7 @@ class CollectionStore extends ChangeNotifier {
   void addCardWithSnapshot({
     required PokemonCardResult card,
     required int userGrade,
+    String? localPhotoPath,
     String? finish,
     double? market,
     double? high,
@@ -77,6 +80,7 @@ class CollectionStore extends ChangeNotifier {
         addedAt: DateTime.now(),
         userGrade: userGrade,
         finish: finish,
+        localPhotoPath: localPhotoPath,
         marketAtSave: market,
         highAtSave: high,
         estLowAtSave: estLow,
@@ -87,9 +91,16 @@ class CollectionStore extends ChangeNotifier {
   }
 
   // Keep the old method for places you haven't updated yet
-  void addCard(PokemonCardResult card) {
+  void addCard(PokemonCardResult card, {String? localPhotoPath}) {
     if (containsCardId(card.id)) return;
-    _items.insert(0, CollectionItem(card: card, addedAt: DateTime.now()));
+    _items.insert(
+      0,
+      CollectionItem(
+        card: card,
+        addedAt: DateTime.now(),
+        localPhotoPath: localPhotoPath,
+      ),
+    );
     notifyListeners();
   }
 

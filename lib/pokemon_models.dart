@@ -28,10 +28,26 @@ class PriceRow {
 class PokemonCardResult {
   final String id;
   final String name;
+
+  // Set info
   final String setName;
+  final String? setId;
+  final int? setPrintedTotal; // denominator on the card set (e.g. "/202")
+
+  // Collector number (left side on the card: "65", "TG05", "SWSH020", etc.)
   final String number;
+
+  // Extra disambiguators (helpful when name+number collide)
+  final int? hp;
+  final String? supertype; // usually "Pokémon"
+  final List<String>
+  subtypes; // e.g. ["Basic"], ["Stage 1"], ["ex"], ["VSTAR"], etc.
+
+  // Images
   final String imageSmall;
   final String imageLarge;
+
+  // Pricing/link
   final String? tcgplayerUrl;
 
   /// finish -> prices (normal, holofoil, reverseHolofoil, etc.)
@@ -46,7 +62,12 @@ class PokemonCardResult {
     required this.imageLarge,
     required this.finishes,
     this.tcgplayerUrl,
-  });
+    this.setId,
+    this.setPrintedTotal,
+    this.hp,
+    this.supertype,
+    List<String>? subtypes,
+  }) : subtypes = subtypes ?? const [];
 
   /// convenience: pick a “best” market price to show in search list
   double? get bestMarket {
@@ -69,6 +90,12 @@ class PokemonCardResult {
     return null;
   }
 
+  bool get isBasic => subtypes.any((s) => s.toLowerCase() == 'basic');
+  bool get isStage1 =>
+      subtypes.any((s) => s.toLowerCase().replaceAll(' ', '') == 'stage1');
+  bool get isStage2 =>
+      subtypes.any((s) => s.toLowerCase().replaceAll(' ', '') == 'stage2');
+
   factory PokemonCardResult.fromJson(Map<String, dynamic> json) {
     final finishesRaw = json['finishes'];
     final finishes = <String, PriceRow>{};
@@ -86,11 +113,27 @@ class PokemonCardResult {
       }
     }
 
+    int? i(dynamic v) {
+      if (v == null) return null;
+      if (v is int) return v;
+      return int.tryParse(v.toString());
+    }
+
+    List<String> listString(dynamic v) {
+      if (v is List) return v.map((e) => e.toString()).toList();
+      return const [];
+    }
+
     return PokemonCardResult(
       id: (json['id'] ?? '').toString(),
       name: (json['name'] ?? '').toString(),
       setName: (json['setName'] ?? '').toString(),
+      setId: json['setId']?.toString(),
+      setPrintedTotal: i(json['setPrintedTotal']),
       number: (json['number'] ?? '').toString(),
+      hp: i(json['hp']),
+      supertype: json['supertype']?.toString(),
+      subtypes: listString(json['subtypes']),
       imageSmall: (json['imageSmall'] ?? '').toString(),
       imageLarge: (json['imageLarge'] ?? '').toString(),
       tcgplayerUrl: json['tcgplayerUrl']?.toString(),
@@ -103,18 +146,16 @@ class PokemonCardResult {
       'id': id,
       'name': name,
       'setName': setName,
+      'setId': setId,
+      'setPrintedTotal': setPrintedTotal,
       'number': number,
+      'hp': hp,
+      'supertype': supertype,
+      'subtypes': subtypes,
       'imageSmall': imageSmall,
       'imageLarge': imageLarge,
       'tcgplayerUrl': tcgplayerUrl,
-      'finishes': finishes.map(
-        (k, v) => MapEntry(k, {
-          'market': v.market,
-          'low': v.low,
-          'mid': v.mid,
-          'high': v.high,
-        }),
-      ),
+      'finishes': finishes.map((k, v) => MapEntry(k, v.toJson())),
     };
   }
 }
