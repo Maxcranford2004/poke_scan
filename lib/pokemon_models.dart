@@ -1,3 +1,5 @@
+// lib/pokemon_models.dart
+
 class PriceRow {
   final double? market;
   final double? low;
@@ -8,7 +10,6 @@ class PriceRow {
 
   factory PriceRow.fromJson(Map<String, dynamic> json) {
     double? d(dynamic v) => v is num ? v.toDouble() : null;
-
     return PriceRow(
       market: d(json['market']),
       low: d(json['low']),
@@ -40,10 +41,9 @@ class PokemonCardResult {
   // Extra disambiguators (helpful when name+number collide)
   final int? hp;
   final String? supertype; // usually "Pokémon"
-  final List<String>
-  subtypes; // e.g. ["Basic"], ["Stage 1"], ["ex"], ["VSTAR"], etc.
+  final List<String> subtypes; // e.g. ["Basic"], ["Stage 1"], ["ex"], etc.
 
-  // Images
+  // Images (NON-null strings so UI code stays simple)
   final String imageSmall;
   final String imageLarge;
 
@@ -97,9 +97,22 @@ class PokemonCardResult {
       subtypes.any((s) => s.toLowerCase().replaceAll(' ', '') == 'stage2');
 
   factory PokemonCardResult.fromJson(Map<String, dynamic> json) {
-    final finishesRaw = json['finishes'];
+    int? i(dynamic v) {
+      if (v == null) return null;
+      if (v is int) return v;
+      return int.tryParse(v.toString());
+    }
+
+    List<String> listString(dynamic v) {
+      if (v is List) return v.map((e) => e.toString()).toList();
+      return const [];
+    }
+
+    // ---- finishes/prices: support BOTH flattened cache format and raw API format
     final finishes = <String, PriceRow>{};
 
+    // flattened: finishes: { holofoil: {...}, ... }
+    final finishesRaw = json['finishes'];
     if (finishesRaw is Map) {
       for (final entry in finishesRaw.entries) {
         final k = entry.key?.toString() ?? '';
@@ -113,30 +126,65 @@ class PokemonCardResult {
       }
     }
 
-    int? i(dynamic v) {
-      if (v == null) return null;
-      if (v is int) return v;
-      return int.tryParse(v.toString());
+    // raw API: tcgplayer: { prices: { holofoil: {...}, ... }, url: ... }
+    final tcg = json['tcgplayer'];
+    final tcgPrices = (tcg is Map) ? tcg['prices'] : null;
+    if (finishes.isEmpty && tcgPrices is Map) {
+      for (final entry in tcgPrices.entries) {
+        final k = entry.key?.toString() ?? '';
+        final v = entry.value;
+        if (k.isEmpty) continue;
+        if (v is Map<String, dynamic>) {
+          finishes[k] = PriceRow.fromJson(v);
+        } else if (v is Map) {
+          finishes[k] = PriceRow.fromJson(Map<String, dynamic>.from(v));
+        }
+      }
     }
 
-    List<String> listString(dynamic v) {
-      if (v is List) return v.map((e) => e.toString()).toList();
-      return const [];
+    // ---- set info: flattened OR nested
+    String setName = (json['setName'] ?? '').toString();
+    String? setId = json['setId']?.toString();
+    int? setPrintedTotal = i(json['setPrintedTotal']);
+
+    final setObj = json['set'];
+    if (setObj is Map) {
+      if (setName.isEmpty) setName = (setObj['name'] ?? '').toString();
+      setId ??= setObj['id']?.toString();
+      setPrintedTotal ??= i(setObj['printedTotal']);
+    }
+
+    // ---- images: flattened OR nested
+    String imageSmall = (json['imageSmall'] ?? '').toString();
+    String imageLarge = (json['imageLarge'] ?? '').toString();
+
+    final imagesObj = json['images'];
+    if (imagesObj is Map) {
+      if (imageSmall.isEmpty)
+        imageSmall = (imagesObj['small'] ?? '').toString();
+      if (imageLarge.isEmpty)
+        imageLarge = (imagesObj['large'] ?? '').toString();
+    }
+
+    // ---- tcgplayer url: flattened OR nested
+    String? tcgplayerUrl = json['tcgplayerUrl']?.toString();
+    if (tcgplayerUrl == null && tcg is Map) {
+      tcgplayerUrl = tcg['url']?.toString();
     }
 
     return PokemonCardResult(
       id: (json['id'] ?? '').toString(),
       name: (json['name'] ?? '').toString(),
-      setName: (json['setName'] ?? '').toString(),
-      setId: json['setId']?.toString(),
-      setPrintedTotal: i(json['setPrintedTotal']),
+      setName: setName,
+      setId: setId,
+      setPrintedTotal: setPrintedTotal,
       number: (json['number'] ?? '').toString(),
       hp: i(json['hp']),
       supertype: json['supertype']?.toString(),
       subtypes: listString(json['subtypes']),
-      imageSmall: (json['imageSmall'] ?? '').toString(),
-      imageLarge: (json['imageLarge'] ?? '').toString(),
-      tcgplayerUrl: json['tcgplayerUrl']?.toString(),
+      imageSmall: imageSmall,
+      imageLarge: imageLarge,
+      tcgplayerUrl: tcgplayerUrl,
       finishes: finishes,
     );
   }
