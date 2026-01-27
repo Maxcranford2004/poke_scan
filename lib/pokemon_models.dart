@@ -26,50 +26,81 @@ class PriceRow {
   };
 }
 
+/// Used for the “blank slot -> preview” UX (Step 2).
+/// This is intentionally lightweight so it’s fast to cache.
+class PreviewCard {
+  final String id; // ✅ add this
+  final String name;
+  final String imageSmall;
+  final String imageLarge;
+
+  const PreviewCard({
+    required this.id, // ✅ add this
+    required this.name,
+    required this.imageSmall,
+    required this.imageLarge,
+  });
+}
+
+extension PokemonCardResultPreview on PokemonCardResult {
+  PreviewCard toPreview() {
+    return PreviewCard(
+      id: id, // ✅ now valid
+      name: name,
+      imageSmall: imageSmall,
+      imageLarge: imageLarge,
+    );
+  }
+}
+
 class PokemonCardResult {
   final String id;
   final String name;
 
   // Set info
   final String setName;
-  final String? setId;
-  final int? setPrintedTotal; // denominator on the card set (e.g. "/202")
+  final String setId; // make non-null so main.dart stops complaining
+  final int? setPrintedTotal;
 
-  // Collector number (left side on the card: "65", "TG05", "SWSH020", etc.)
+  // Collector number ("65", "TG05", "SWSH127", etc.)
   final String number;
 
-  // Extra disambiguators (helpful when name+number collide)
+  // Disambiguators
   final int? hp;
-  final String? supertype; // usually "Pokémon"
-  final List<String> subtypes; // e.g. ["Basic"], ["Stage 1"], ["ex"], etc.
+  final String? supertype;
+  final List<String> subtypes;
 
-  // Images (NON-null strings so UI code stays simple)
+  // Images
   final String imageSmall;
   final String imageLarge;
 
   // Pricing/link
   final String? tcgplayerUrl;
-
-  /// finish -> prices (normal, holofoil, reverseHolofoil, etc.)
   final Map<String, PriceRow> finishes;
 
   PokemonCardResult({
     required this.id,
     required this.name,
     required this.setName,
+    required this.setId,
     required this.number,
     required this.imageSmall,
     required this.imageLarge,
     required this.finishes,
     this.tcgplayerUrl,
-    this.setId,
     this.setPrintedTotal,
     this.hp,
     this.supertype,
     List<String>? subtypes,
   }) : subtypes = subtypes ?? const [];
 
-  /// convenience: pick a “best” market price to show in search list
+  PreviewCard toPreview() => PreviewCard(
+    id: id,
+    name: name,
+    imageSmall: imageSmall,
+    imageLarge: imageLarge,
+  );
+
   double? get bestMarket {
     const preferred = [
       'normal',
@@ -108,10 +139,9 @@ class PokemonCardResult {
       return const [];
     }
 
-    // ---- finishes/prices: support BOTH flattened cache format and raw API format
+    // finishes/prices: flattened OR raw API format
     final finishes = <String, PriceRow>{};
 
-    // flattened: finishes: { holofoil: {...}, ... }
     final finishesRaw = json['finishes'];
     if (finishesRaw is Map) {
       for (final entry in finishesRaw.entries) {
@@ -126,7 +156,6 @@ class PokemonCardResult {
       }
     }
 
-    // raw API: tcgplayer: { prices: { holofoil: {...}, ... }, url: ... }
     final tcg = json['tcgplayer'];
     final tcgPrices = (tcg is Map) ? tcg['prices'] : null;
     if (finishes.isEmpty && tcgPrices is Map) {
@@ -142,19 +171,19 @@ class PokemonCardResult {
       }
     }
 
-    // ---- set info: flattened OR nested
+    // set info: flattened OR nested
     String setName = (json['setName'] ?? '').toString();
-    String? setId = json['setId']?.toString();
+    String setId = (json['setId'] ?? '').toString();
     int? setPrintedTotal = i(json['setPrintedTotal']);
 
     final setObj = json['set'];
     if (setObj is Map) {
       if (setName.isEmpty) setName = (setObj['name'] ?? '').toString();
-      setId ??= setObj['id']?.toString();
+      if (setId.isEmpty) setId = (setObj['id'] ?? '').toString();
       setPrintedTotal ??= i(setObj['printedTotal']);
     }
 
-    // ---- images: flattened OR nested
+    // images: flattened OR nested
     String imageSmall = (json['imageSmall'] ?? '').toString();
     String imageLarge = (json['imageLarge'] ?? '').toString();
 
@@ -166,7 +195,7 @@ class PokemonCardResult {
         imageLarge = (imagesObj['large'] ?? '').toString();
     }
 
-    // ---- tcgplayer url: flattened OR nested
+    // tcgplayer url: flattened OR nested
     String? tcgplayerUrl = json['tcgplayerUrl']?.toString();
     if (tcgplayerUrl == null && tcg is Map) {
       tcgplayerUrl = tcg['url']?.toString();
@@ -176,7 +205,7 @@ class PokemonCardResult {
       id: (json['id'] ?? '').toString(),
       name: (json['name'] ?? '').toString(),
       setName: setName,
-      setId: setId,
+      setId: setId, // non-null now
       setPrintedTotal: setPrintedTotal,
       number: (json['number'] ?? '').toString(),
       hp: i(json['hp']),

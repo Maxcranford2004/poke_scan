@@ -1,11 +1,9 @@
 import 'dart:convert';
-import 'dart:math';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
 
 import 'pokemon_models.dart';
 
-/// Pass your key at run-time (don’t hardcode it):
 /// flutter run --dart-define=POKEMON_TCG_API_KEY=YOUR_KEY
 const String kPokemonTcgApiKey = String.fromEnvironment(
   'POKEMON_TCG_API_KEY',
@@ -51,6 +49,16 @@ class PokemonTcgApi {
     return h;
   }
 
+  // ------------------- Small JSON helpers -------------------
+
+  Map<String, dynamic>? _map(dynamic v) {
+    if (v is Map<String, dynamic>) return v;
+    if (v is Map) return Map<String, dynamic>.from(v);
+    return null;
+  }
+
+  List<dynamic>? _list(dynamic v) => v is List ? v : null;
+
   // ------------------- Cleaning / normalization -------------------
 
   String _cleanName(String s) {
@@ -61,141 +69,63 @@ class PokemonTcgApi {
     t = t.replaceAll(RegExp(r"[^A-Za-z0-9\s\-']"), ' ');
     t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
 
-    // ✅ Fix common OCR confusion: lowercase 'l' mistaken for capital 'I'
+    // common OCR confusion
     if (t.toLowerCase().startsWith('lvysaur')) t = 'ivysaur';
     if (t.toLowerCase().startsWith('snorlaz')) t = 'snorlax';
 
-    // ✅ NEW: if OCR glues garbage letters before the real Pokémon name,
-    // keep the last "wordy" chunk (common when Stage/labels get attached)
-    // Example: "STAEEGengar" -> "Gengar"
-    // Example: "STAGE Gengar" -> "Gengar"
-    // If OCR glued garbage letters before the real name (e.g. "STAEEGengar"),
-    // keep the trailing capitalized name chunk, BUT only when it looks like that pattern.
-    if (!t.contains(' ')) {
+    // glued prefix garbage like "STAEEGengar" -> "Gengar"
+    if (!t.contains(' ') && t.length > 8) {
       final m2 = RegExp(r'([A-Z][a-z]{2,})$').firstMatch(t);
       if (m2 != null) {
         final tail = m2.group(1)!;
-        // Only apply if it actually shortens the string meaningfully (avoids harming legit names)
-        if (tail.length >= 4 && tail.length <= 20 && tail.length < t.length) {
-          t = tail;
-        }
+        if (tail.length >= 4 && tail.length < t.length) t = tail;
       }
-    }
-
-    // ✅ NEW: If it's one long token and contains a known name at the end,
-    // keep the trailing capitalized run (helps "STAEEGengar" style)
-    if (!t.contains(' ') && t.length > 8) {
-      final m2 = RegExp(r'([A-Z][a-z]{2,})$').firstMatch(t);
-      if (m2 != null) t = m2.group(1)!;
     }
 
     return t;
   }
 
   String _escapeLucene(String s) {
-    // Escape quotes/backslashes for the API query syntax.
     return s.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
   }
 
-  /// Returns something like:
-  /// - "65"
-  /// - "TG5"
-  /// - "SWSH20"
-  /// - "183/165"
+  /// Returns cleaned collector number:
+  /// - digits-only => "183"
+  /// - prefix+digits => "SWSH127", "TG5"
   String? _cleanCollectorNumber(String? raw) {
     if (raw == null) return null;
     var t = raw.trim();
     if (t.isEmpty) return null;
 
-    // If OCR gives "39/73" or "183/165", keep only the left side for searching.
+    // If OCR gives "183/165", keep only left side
     if (t.contains('/')) t = t.split('/').first.trim();
 
-    // Promo / prefix+digits (SWSH127, TG05, etc.)
-    final mPref = RegExp(r'^([A-Za-z]{1,8})\s*0*(\d{1,4})$').firstMatch(t);
-    if (mPref != null) {
-      final pref = mPref.group(1)!.toUpperCase();
-      final num = int.parse(
-        mPref.group(2)!,
-      ).toString(); // removes leading zeros
-      return '$pref$num';
+    // Prefix+digits
+    final pref = RegExp(r'^([A-Za-z]{1,8})\s*0*(\d{1,4})$').firstMatch(t);
+    if (pref != null) {
+      final prefix = pref.group(1)!.toUpperCase();
+      final num = int.parse(pref.group(2)!).toString();
+      return '$prefix$num';
     }
 
     // Digits only
     final digits = t.replaceAll(RegExp(r'[^0-9]'), '');
     if (digits.isEmpty) return null;
 
-    final normalized = digits.replaceFirst(RegExp(r'^0+'), '');
-    if (normalized.isEmpty) return null;
+    final n = int.tryParse(digits);
+    if (n == null) return null;
+    if (n <= 0 || n > 999) return null;
 
-    // common OCR artifact: extra leading digit on 3-digit numbers (2183 -> 183)
-    if (normalized.length == 4) return normalized.substring(1);
-
-    // clamp weird long digit strings to last 3 digits
-    return normalized.length > 3
-        ? normalized.substring(normalized.length - 3)
-        : normalized;
-  }
-
-  List<String> _collectorVariants(String collector) {
-    final t = collector.trim();
-    if (t.isEmpty) return const [];
-
-    final out = <String>{};
-
-    // If fraction like 183/165, keep as is + also left side.
-    if (t.contains('/')) {
-      out.add(t);
-      final left = t.split('/').first;
-      if (left.isNotEmpty) out.add(left);
-      return out.toList();
-    }
-
-    // Digits only: strip leading zeros.
-    // Also: if OCR accidentally prepends a digit (e.g. 2183), try the tail (183).
-    final mDigits = RegExp(r'^0*(\d{1,4})$').firstMatch(t);
-    if (mDigits != null) {
-      final normalized = int.parse(mDigits.group(1)!).toString();
-      out.add(normalized);
-      out.add(t);
-
-      // Fix common OCR artifact: extra leading digit on 3-digit numbers (2183 -> 183)
-      if (normalized.length == 4) {
-        out.add(normalized.substring(1)); // last 3 digits
-        out.add(normalized.substring(2)); // last 2 digits (backup)
-      }
-
-      return out.toList();
-    }
-
-    // Prefix+digits (TG05, SWSH020)
-    final mPref = RegExp(r'^([A-Za-z]{1,6})0*(\d{1,4})$').firstMatch(t);
-    if (mPref != null) {
-      final pref = mPref.group(1)!.toUpperCase();
-      final num = int.parse(mPref.group(2)!).toString();
-      out.add('$pref$num');
-      out.add('$pref${mPref.group(2)!}'); // keep original digits too
-      out.add(t.toUpperCase());
-      return out.toList();
-    }
-
-    out.add(t);
-    out.add(t.toUpperCase());
-    return out.toList();
+    return n.toString();
   }
 
   int? _parseSetTotal(String? s) {
     if (s == null) return null;
-
-    // keep digits only
     final digits = s.replaceAll(RegExp(r'[^0-9]'), '');
     if (digits.isEmpty) return null;
-
     final n = int.tryParse(digits);
     if (n == null) return null;
-
-    // sanity range (sets are usually < 400)
     if (n < 10 || n > 400) return null;
-
     return n;
   }
 
@@ -206,52 +136,50 @@ class PokemonTcgApi {
 
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        // Print BEFORE request so timeouts still show which URL we tried.
+        // keep logs readable
         // ignore: avoid_print
-        print('🛰️ TCG GET (attempt $attempt/$maxAttempts) → $uri');
+        print('🛰️ TCG GET ($attempt/$maxAttempts) → $uri');
 
         final resp = await http
             .get(uri, headers: _headers())
             .timeout(const Duration(seconds: 25));
 
-        // Debug prints
-        final body = resp.body;
-        final previewLen = body.length < 200 ? body.length : 200;
         // ignore: avoid_print
-        print('🛰️ TCG STATUS: ${resp.statusCode}');
-        // ignore: avoid_print
-        print('🛰️ TCG BODY (first 200): ${body.substring(0, previewLen)}');
+        print('🛰️ STATUS: ${resp.statusCode}');
 
         return resp;
       } catch (e) {
-        // On last attempt, rethrow.
+        // ignore: avoid_print
+        print('⚠️ TCG GET error: $e');
         if (attempt == maxAttempts) rethrow;
-
-        // Small exponential-ish backoff (250ms, 500ms)
         await Future<void>.delayed(Duration(milliseconds: 250 * attempt));
       }
     }
 
-    // Unreachable, but Dart wants a return.
     throw StateError('unreachable');
-  }
-
-  List<PokemonCardResult> _parseCardList(String body) {
-    final decoded = jsonDecode(body);
-    final data = decoded is Map ? decoded['data'] : null;
-    if (data is! List) return const [];
-
-    return data
-        .whereType<Map>()
-        .map((e) => PokemonCardResult.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
   }
 
   PokemonCardResult? _parseSingleCard(String body) {
     final decoded = jsonDecode(body);
-    final data = decoded is Map ? decoded['data'] : null;
-    if (data is! Map) return null;
-    return PokemonCardResult.fromJson(Map<String, dynamic>.from(data));
+    final root = _map(decoded);
+    final data = _map(root?['data']);
+    if (data == null) return null;
+    return PokemonCardResult.fromJson(data);
+  }
+
+  List<PokemonCardResult> _parseCardList(String body) {
+    final decoded = jsonDecode(body);
+    final root = _map(decoded);
+    final dataList = _list(root?['data']);
+    if (dataList == null) return const [];
+
+    final out = <PokemonCardResult>[];
+    for (final item in dataList) {
+      final m = _map(item);
+      if (m == null) continue;
+      out.add(PokemonCardResult.fromJson(m));
+    }
+    return out;
   }
 
   String _cacheKeyForSearch({
@@ -269,6 +197,55 @@ class PokemonTcgApi {
       (setTotal ?? '').trim(),
       pageSize.toString(),
     ].join('|');
+  }
+
+  // ------------------- Set index (Step 2 / grayscale previews) -------------------
+
+  /// Fetches ALL cards for a set (used for “what card goes in this slot?” previews).
+  /// Cached under: setindex|<setId>
+  Future<List<PokemonCardResult>> fetchAllCardsForSet(String setId) async {
+    final cacheKey = 'setindex|$setId';
+    final cached = _box.get(cacheKey);
+    if (cached is String) {
+      try {
+        return _parseCardList(cached);
+      } catch (_) {}
+    }
+
+    const pageSize = 250;
+    var page = 1;
+    final all = <PokemonCardResult>[];
+
+    while (true) {
+      final uri = Uri.https(_host, _cardsPath, {
+        'q': 'set.id:$setId',
+        'pageSize': pageSize.toString(),
+        'page': page.toString(),
+        'orderBy': 'number',
+      });
+
+      final resp = await _get(uri);
+
+      // API has been flaky for you. Don’t crash the app.
+      if (resp.statusCode != 200) {
+        break;
+      }
+
+      final batch = _parseCardList(resp.body);
+      all.addAll(batch);
+
+      if (batch.length < pageSize) break; // last page
+      page++;
+
+      // safety cap
+      if (page > 25) break;
+    }
+
+    // Cache combined list as a wrapped JSON that _parseCardList understands.
+    final wrapped = {'data': all.map((c) => c.toJson()).toList()};
+    await _box.put(cacheKey, jsonEncode(wrapped));
+
+    return all;
   }
 
   // ------------------- Public API used by your app -------------------
@@ -315,8 +292,7 @@ class PokemonTcgApi {
     await _box.put(key, body);
   }
 
-  /// BROAD search by name/number/setTotal. We intentionally do NOT include hp/stage
-  /// in the query because they are often missing/inconsistent.
+  /// BROAD search by name/number/setTotal.
   Future<List<PokemonCardResult>> refreshSearch({
     required String name,
     String? set,
@@ -329,20 +305,19 @@ class PokemonTcgApi {
     final safeSet = (set ?? '').trim();
     final printedTotal = _parseSetTotal(setTotal);
 
-    // Allow number-only searches (OCR name may be wrong)
     final hasName = safeName.isNotEmpty;
     final hasNumber = cleanNum != null && cleanNum.isNotEmpty;
     if (!hasName && !hasNumber) return <PokemonCardResult>[];
 
     final parts = <String>[];
 
-    if (hasName) {
-      // token search is more forgiving than quoting the whole string
+    // include name tokens only if we do NOT have a collector number
+    if (hasName && !hasNumber) {
       final tokens = safeName
           .split(RegExp(r'\s+'))
           .where((t) => t.isNotEmpty)
-          .toList();
-      for (final t in tokens.take(3)) {
+          .take(3);
+      for (final t in tokens) {
         parts.add('name:${_escapeLucene(t)}');
       }
     }
@@ -352,39 +327,35 @@ class PokemonTcgApi {
     }
 
     if (hasNumber) {
-      var baseNum = cleanNum!.trim();
-
-      // If it contains a slash, keep only the left side (e.g. 183/165 -> 183)
-      if (baseNum.contains('/')) {
-        baseNum = baseNum.split('/').first.trim();
-      }
-
+      // Try 1–2 safe variants (handles common OCR artifacts like 2183 -> 183)
       final variants = <String>[];
 
-      final hasLetters = RegExp(r'[A-Za-z]').hasMatch(baseNum);
+      var base = cleanNum!.trim();
+
+      // If OCR gives "183/165", keep only left side
+      if (base.contains('/')) base = base.split('/').first.trim();
+
+      final hasLetters = RegExp(r'[A-Za-z]').hasMatch(base);
 
       if (hasLetters) {
-        // PROMO/PREFIX numbers (SWSH127, TG05, etc.)
-        // Keep as-is (already cleaned by _cleanCollectorNumber)
-        variants.add(baseNum.toUpperCase());
+        // Promo/prefix numbers (TG05, SWSH127...)
+        variants.add(base.toUpperCase());
 
-        // Also try digits-only as a fallback (sometimes OCR drops prefix)
-        final digitsOnly = baseNum.replaceAll(RegExp(r'[^0-9]'), '');
+        // Also try digits-only fallback
+        final digitsOnly = base.replaceAll(RegExp(r'[^0-9]'), '');
         if (digitsOnly.isNotEmpty) variants.add(digitsOnly);
       } else {
-        // DIGITS-only collector numbers
-        var digits = baseNum.replaceAll(RegExp(r'[^0-9]'), '');
-        if (digits.isNotEmpty) baseNum = digits;
+        // Digits-only
+        var digits = base.replaceAll(RegExp(r'[^0-9]'), '');
+        if (digits.isNotEmpty) base = digits;
 
-        variants.add(baseNum);
+        variants.add(base);
 
-        // If OCR made it 4 digits, also try the last 3 digits (2183 -> 183).
-        if (baseNum.length == 4) {
-          variants.add(baseNum.substring(1));
-        }
+        // Common OCR artifact: extra leading digit on a 3-digit number (2183 -> 183)
+        if (base.length == 4) variants.add(base.substring(1));
       }
 
-      // De-dupe + keep small
+      // de-dupe and keep small (max 2)
       final uniq = <String>{};
       final finalVariants = <String>[];
       for (final v in variants) {
@@ -407,7 +378,6 @@ class PokemonTcgApi {
     }
 
     if (printedTotal != null) {
-      // Key field to disambiguate 15/108 vs 16/181 etc
       parts.add('set.printedTotal:$printedTotal');
     }
 
@@ -419,20 +389,41 @@ class PokemonTcgApi {
     });
 
     final resp = await _get(uri);
-    if (resp.statusCode != 200) {
-      throw Exception('TCG API ${resp.statusCode}');
+
+    if (resp.statusCode == 200) {
+      await _saveCachedSearch(
+        name: name,
+        set: set,
+        number: number,
+        setTotal: setTotal,
+        pageSize: pageSize,
+        body: resp.body,
+      );
+      return _parseCardList(resp.body);
     }
 
-    await _saveCachedSearch(
+    // IMPORTANT: if live fetch fails, DO NOT wipe the UI.
+    // Return cached results instead (if any). This prevents the “flash then no results” bug.
+    final cached = await getCachedSearch(
       name: name,
       set: set,
       number: number,
       setTotal: setTotal,
       pageSize: pageSize,
-      body: resp.body,
     );
 
-    return _parseCardList(resp.body);
+    if (cached.isNotEmpty) {
+      // ignore: avoid_print
+      print(
+        '⚠️ Live search failed (${resp.statusCode}). Keeping cached results (${cached.length}).',
+      );
+      return cached;
+    }
+
+    // If there was no cache to fall back to:
+    if (resp.statusCode == 404) return <PokemonCardResult>[];
+
+    throw Exception('TCG API ${resp.statusCode}');
   }
 
   Future<PokemonCardResult?> fetchCardById(String id) async {
@@ -455,8 +446,6 @@ class PokemonTcgApi {
 
   /// Reliable scan strategy for RecognizingScreen.
   /// Returns best card if confident, else candidates list.
-  /// Reliable scan strategy for RecognizingScreen.
-  /// Returns best card if confident, else candidates list.
   Future<ReliablePick> searchCardsReliable({
     required String name,
     String? number,
@@ -468,15 +457,12 @@ class PokemonTcgApi {
     final lowerName = safeName.toLowerCase().trim();
     final wantNum = _cleanCollectorNumber(number);
 
-    // Treat "label" OCR results as not-a-real-name (common on Trainer/Energy cards)
     final isLabel =
         lowerName == 'trainer' ||
         lowerName == 'traner' ||
         lowerName == 'pokemon' ||
-        lowerName == 'energy' ||
-        lowerName == 'traner'; // keep extra variant if OCR keeps doing this
+        lowerName == 'energy';
 
-    // If label-only, do number-only search and NEVER auto-pick a single card.
     if (isLabel) {
       if (wantNum == null || wantNum.isEmpty) {
         return ReliablePick(
@@ -486,7 +472,6 @@ class PokemonTcgApi {
         );
       }
 
-      // IMPORTANT: ignore setTotal here (trainer banners hallucinate totals like 286)
       var live = await refreshSearch(
         name: '',
         set: null,
@@ -495,19 +480,17 @@ class PokemonTcgApi {
         pageSize: 50,
       );
 
-      // Filter by supertype when possible to reduce junk
+      // Filter by supertype if possible
       if (lowerName == 'trainer' || lowerName == 'traner') {
         live = live
             .where((c) => (c.supertype ?? '').toLowerCase() == 'trainer')
             .toList();
       } else if (lowerName == 'energy') {
-        // Energy cards are usually supertype = "Energy"
         live = live
             .where((c) => (c.supertype ?? '').toLowerCase() == 'energy')
             .toList();
       }
 
-      // If filtering nukes everything, fall back to unfiltered list
       if (live.isEmpty) {
         live = await refreshSearch(
           name: '',
@@ -519,15 +502,13 @@ class PokemonTcgApi {
       }
 
       return ReliablePick(
-        best: null, // <- key behavior change
+        best: null,
         candidates: live.take(12).toList(),
         strategy: 'label-candidates',
       );
     }
 
-    // ---------------- Normal Pokémon-style flow ----------------
-
-    // Broad live search
+    // Normal flow
     var live = await refreshSearch(
       name: name,
       set: null,
@@ -536,7 +517,6 @@ class PokemonTcgApi {
       pageSize: 50,
     );
 
-    // If nothing, try name-only
     if (live.isEmpty) {
       live = await refreshSearch(
         name: name,
@@ -551,7 +531,6 @@ class PokemonTcgApi {
       return ReliablePick(best: null, candidates: const [], strategy: 'empty');
     }
 
-    // Score results locally
     final wantTotal = _parseSetTotal(setTotal);
     final wantStage = (stage ?? '').trim().toLowerCase();
 
@@ -560,26 +539,19 @@ class PokemonTcgApi {
 
       // number match
       if (wantNum != null && wantNum.isNotEmpty) {
-        final cn = (c.number).toUpperCase();
-
+        final cn = c.number.toUpperCase();
         if (cn == wantNum.toUpperCase()) s += 60;
 
-        if (wantTotal != null && cn == '${wantNum.toUpperCase()}/$wantTotal') {
-          s += 80;
-        }
-
-        if (cn.contains('/') && cn.split('/').first == wantNum.toUpperCase()) {
+        if (wantTotal != null &&
+            cn.contains('/') &&
+            cn.split('/').first == wantNum.toUpperCase()) {
           s += 35;
         }
       }
 
-      // set printed total match
       if (wantTotal != null && c.setPrintedTotal == wantTotal) s += 30;
-
-      // hp match
       if (hp != null && c.hp == hp) s += 18;
 
-      // stage match (only check if provided)
       if (wantStage.isNotEmpty) {
         for (final st in c.subtypes) {
           if (st.toLowerCase() == wantStage) {
@@ -589,7 +561,6 @@ class PokemonTcgApi {
         }
       }
 
-      // name tokens match
       final safe = _cleanName(name).toLowerCase();
       if (safe.isNotEmpty) {
         final tokens = safe
@@ -611,7 +582,6 @@ class PokemonTcgApi {
     final bestScore = score(best);
     final secondScore = live.length > 1 ? score(live[1]) : -999;
 
-    // Confidence rule: good score and clear separation
     final confident = bestScore >= 80 && (bestScore - secondScore) >= 12;
 
     return ReliablePick(

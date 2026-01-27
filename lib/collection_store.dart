@@ -1,22 +1,24 @@
 import 'package:flutter/foundation.dart';
 import 'pokemon_models.dart';
+import 'pokemon_tcg_api.dart';
 
-class CollectionItem {
+/// One owned card entry (duplicates allowed via entryId).
+class CollectionEntry {
+  final String entryId;
   final PokemonCardResult card;
   final DateTime addedAt;
 
-  // What the user chose on details screen
   final int userGrade; // 1..10
-  final String? finish; // e.g. normal, holofoil, reverseHolofoil
-  final String? localPhotoPath; // user scan photo stored locally (optional)
+  final String? finish;
+  final String? localPhotoPath;
 
-  // Pricing snapshot at time of save
   final double? marketAtSave;
   final double? highAtSave;
   final double? estLowAtSave;
   final double? estHighAtSave;
 
-  CollectionItem({
+  CollectionEntry({
+    required this.entryId,
     required this.card,
     required this.addedAt,
     this.userGrade = 8,
@@ -34,33 +36,67 @@ class CollectionItem {
   }
 }
 
+/// Summary used by your Sets list UI in main.dart.
+class SetSummary {
+  final String setKey; // keep the name main.dart expects
+  final String setName;
+
+  final int ownedInstances; // including duplicates
+  final int ownedUniqueSlots; // distinct card ids
+  final int? printedTotal;
+
+  SetSummary({
+    required this.setKey,
+    required this.setName,
+    required this.ownedInstances,
+    required this.ownedUniqueSlots,
+    required this.printedTotal,
+  });
+
+  /// Some older parts of main.dart might use setId wording.
+  /// Make it NON-null to avoid the String? error you hit.
+  String get setId => setKey;
+
+  double get progress {
+    final total = printedTotal;
+    if (total == null || total <= 0) return 0;
+    return ownedUniqueSlots / total;
+  }
+
+  String get progressText {
+    final total = printedTotal;
+    if (total == null || total <= 0) return '$ownedUniqueSlots';
+    return '$ownedUniqueSlots/$total';
+  }
+}
+
 class CollectionStore extends ChangeNotifier {
-  final List<CollectionItem> _items = [];
+  final List<CollectionEntry> _entries = [];
 
-  List<CollectionItem> get items => List.unmodifiable(_items);
-  int get count => _items.length;
+  List<CollectionEntry> get items => List.unmodifiable(_entries);
+  int get count => _entries.length;
 
-  bool containsCardId(String id) => _items.any((e) => e.card.id == id);
+  bool containsCardId(String id) => _entries.any((e) => e.card.id == id);
 
-  /// Primary total shown to user (uses saved estimate if available; otherwise market).
   double get totalEstimatedValue {
     double sum = 0;
-    for (final item in _items) {
+    for (final item in _entries) {
       final v = item.estimatedMid ?? item.marketAtSave ?? item.card.bestMarket;
       if (v != null) sum += v;
     }
     return sum;
   }
 
-  /// Optional: if you still want raw market total (independent of grade)
   double get totalMarketValue {
     double sum = 0;
-    for (final item in _items) {
+    for (final item in _entries) {
       final m = item.marketAtSave ?? item.card.bestMarket;
       if (m != null) sum += m;
     }
     return sum;
   }
+
+  // ---------------- Add / remove ----------------
 
   void addCardWithSnapshot({
     required PokemonCardResult card,
@@ -72,46 +108,193 @@ class CollectionStore extends ChangeNotifier {
     double? estLow,
     double? estHigh,
   }) {
-    if (containsCardId(card.id)) return;
-    _items.insert(
-      0,
-      CollectionItem(
-        card: card,
-        addedAt: DateTime.now(),
-        userGrade: userGrade,
-        finish: finish,
-        localPhotoPath: localPhotoPath,
-        marketAtSave: market,
-        highAtSave: high,
-        estLowAtSave: estLow,
-        estHighAtSave: estHigh,
-      ),
+    final entry = CollectionEntry(
+      entryId: _newEntryId(),
+      card: card,
+      addedAt: DateTime.now(),
+      userGrade: userGrade,
+      finish: finish,
+      localPhotoPath: localPhotoPath,
+      marketAtSave: market,
+      highAtSave: high,
+      estLowAtSave: estLow,
+      estHighAtSave: estHigh,
     );
+    _entries.insert(0, entry);
     notifyListeners();
   }
 
-  // Keep the old method for places you haven't updated yet
   void addCard(PokemonCardResult card, {String? localPhotoPath}) {
-    if (containsCardId(card.id)) return;
-    _items.insert(
-      0,
-      CollectionItem(
-        card: card,
-        addedAt: DateTime.now(),
-        localPhotoPath: localPhotoPath,
-      ),
+    final entry = CollectionEntry(
+      entryId: _newEntryId(),
+      card: card,
+      addedAt: DateTime.now(),
+      userGrade: 8,
+      localPhotoPath: localPhotoPath,
     );
+    _entries.insert(0, entry);
     notifyListeners();
   }
 
   void removeCardById(String id) {
-    _items.removeWhere((e) => e.card.id == id);
+    _entries.removeWhere((e) => e.card.id == id);
+    notifyListeners();
+  }
+
+  void removeEntryByEntryId(String entryId) {
+    _entries.removeWhere((e) => e.entryId == entryId);
     notifyListeners();
   }
 
   void clear() {
-    _items.clear();
+    _entries.clear();
     notifyListeners();
+  }
+
+  // ---------------- main.dart expects these ----------------
+
+  List<CollectionEntry> itemsForSet(String setKey) {
+    return _entries.where((e) => e.card.setId == setKey).toList();
+  }
+
+  List<SetSummary> getSetSummaries() {
+    final Map<String, List<CollectionEntry>> bySet = {};
+
+    for (final e in _entries) {
+      final sid = e.card.setId.trim();
+      if (sid.isEmpty) continue;
+      (bySet[sid] ??= <CollectionEntry>[]).add(e);
+    }
+
+    final summaries = <SetSummary>[];
+
+    bySet.forEach((setId, list) {
+      final setName = list.first.card.setName;
+      final ownedInstances = list.length;
+      final ownedUniqueSlots = list.map((e) => e.card.id).toSet().length;
+
+      int? printedTotal;
+      for (final e in list) {
+        final pt = e.card.setPrintedTotal;
+        if (pt != null && pt > 0) {
+          printedTotal = pt;
+          break;
+        }
+      }
+
+      summaries.add(
+        SetSummary(
+          setKey: setId,
+          setName: setName,
+          ownedInstances: ownedInstances,
+          ownedUniqueSlots: ownedUniqueSlots,
+          printedTotal: printedTotal,
+        ),
+      );
+    });
+
+    // sort by newest activity in the set
+    summaries.sort((a, b) {
+      final aNewest = bySet[a.setKey]!
+          .map((e) => e.addedAt)
+          .reduce((x, y) => x.isAfter(y) ? x : y);
+      final bNewest = bySet[b.setKey]!
+          .map((e) => e.addedAt)
+          .reduce((x, y) => x.isAfter(y) ? x : y);
+      return bNewest.compareTo(aNewest);
+    });
+
+    return summaries;
+  }
+
+  Map<int, PokemonCardResult> getOwnedSlotMapForSet(String setKey) {
+    final entries = itemsForSet(setKey);
+    final out = <int, PokemonCardResult>{};
+
+    for (final e in entries) {
+      final digits = e.card.number.replaceAll(RegExp(r'[^0-9]'), '');
+      final n = int.tryParse(digits);
+      if (n == null) continue;
+
+      // newest wins (entries are newest-first anyway)
+      out[n] = e.card;
+    }
+
+    return out;
+  }
+
+  int registeredCountForSet(String setKey) {
+    final entries = itemsForSet(setKey);
+    return entries.map((e) => e.card.id).toSet().length;
+  }
+
+  /// Step 2: slotNumber -> PreviewCard (name + image urls)
+  /// Returns empty until ensureSetIndexLoaded() has been called for that set.
+  Map<int, PreviewCard> getPreviewSlotMapForSet(String setKey) {
+    final map = _setIndex[setKey];
+    if (map == null || map.isEmpty) return <int, PreviewCard>{};
+
+    final out = <int, PreviewCard>{};
+    map.forEach((slot, card) {
+      out[slot] = card.toPreview();
+    });
+    return out;
+  }
+
+  // ---------------- Step 2 Preview Index ----------------
+  //
+  // Goal: when you tap a missing slot (e.g. #007), you can show a preview
+  // image (later we’ll grayscale it) + locked details + scan button.
+  //
+  // For now: this returns cached preview info if index was loaded.
+  // Next step will be wiring ensureSetIndexLoaded() from your set screen.
+
+  final Map<String, Map<int, PokemonCardResult>> _setIndex = {};
+  final Set<String> _loadingSetIndex = {};
+
+  bool hasSetIndex(String setKey) => _setIndex.containsKey(setKey);
+
+  Future<void> ensureSetIndexLoaded({
+    required String setKey,
+    required String setId,
+  }) async {
+    if (_setIndex.containsKey(setKey) || _loadingSetIndex.contains(setKey)) {
+      return;
+    }
+    _loadingSetIndex.add(setKey);
+
+    try {
+      if (setId.trim().isEmpty) {
+        _setIndex[setKey] = {};
+        return;
+      }
+
+      final api = PokemonTcgApi();
+      final cards = await api.fetchAllCardsForSet(setId);
+
+      final map = <int, PokemonCardResult>{};
+      for (final c in cards) {
+        final digits = c.number.replaceAll(RegExp(r'[^0-9]'), '');
+        final n = int.tryParse(digits);
+        if (n == null) continue;
+
+        // keep first seen for that slot
+        map.putIfAbsent(n, () => c);
+      }
+
+      _setIndex[setKey] = map;
+      notifyListeners();
+    } finally {
+      _loadingSetIndex.remove(setKey);
+    }
+  }
+
+  // ---------------- Private helpers ----------------
+
+  String _newEntryId() {
+    final micros = DateTime.now().microsecondsSinceEpoch;
+    final salt = _entries.length;
+    return 'e_${micros}_$salt';
   }
 }
 
