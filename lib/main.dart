@@ -15,6 +15,10 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
   await PokemonTcgApi.initCache();
+  collectionStore.seedDemoIfEmpty();
+
+  final api = PokemonTcgApi();
+  api.debugHealthCheck();
 
   final cameras = await availableCameras();
   runApp(CardScanApp(cameras: cameras));
@@ -25,6 +29,30 @@ enum CardType { pokemon, sports }
 extension CardTypeLabel on CardType {
   String get label => this == CardType.pokemon ? 'Pokémon' : 'Sports';
 }
+
+// Shared grayscale matrix (used for “missing/unowned” cards)
+const List<double> kGreyMatrix = <double>[
+  0.2126,
+  0.7152,
+  0.0722,
+  0,
+  0,
+  0.2126,
+  0.7152,
+  0.0722,
+  0,
+  0,
+  0.2126,
+  0.7152,
+  0.0722,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+];
 
 class CardScanApp extends StatelessWidget {
   final List<CameraDescription> cameras;
@@ -574,12 +602,16 @@ class SearchResultsScreen extends StatefulWidget {
   final String? set;
   final String? number;
 
+  // ✅ NEW
+  final List<PokemonCardResult>? prefetched;
+
   const SearchResultsScreen({
     super.key,
     required this.type,
     required this.name,
     this.set,
     this.number,
+    this.prefetched,
   });
 
   @override
@@ -651,7 +683,17 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+
+    final pre = widget.prefetched;
+    if (pre != null && pre.isNotEmpty) {
+      // Show these immediately; don't run the old cache/live search.
+      _results = pre;
+      _loading = false;
+      _updating = false;
+      _error = null;
+    } else {
+      _load();
+    }
   }
 
   Future<void> _load() async {
@@ -783,11 +825,31 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
                     child: ListTile(
                       leading: c.imageSmall.isEmpty
                           ? const Icon(Icons.image_not_supported)
-                          : Image.network(
-                              c.imageSmall,
-                              width: 56,
-                              fit: BoxFit.cover,
+                          : ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: saved
+                                  ? Image.network(
+                                      c.imageSmall,
+                                      width: 56,
+                                      height: 56,
+                                      fit: BoxFit.cover,
+                                    )
+                                  : ColorFiltered(
+                                      colorFilter: const ColorFilter.matrix(
+                                        kGreyMatrix,
+                                      ),
+                                      child: Opacity(
+                                        opacity: 0.45,
+                                        child: Image.network(
+                                          c.imageSmall,
+                                          width: 56,
+                                          height: 56,
+                                          fit: BoxFit.cover,
+                                        ),
+                                      ),
+                                    ),
                             ),
+
                       title: Text('${c.name} • ${c.setName}'),
                       subtitle: Text('#${c.number}\nTap for details'),
                       isThreeLine: true,
@@ -835,7 +897,6 @@ class CollectionScreen extends StatefulWidget {
 class _CollectionScreenState extends State<CollectionScreen> {
   final _searchCtrl = TextEditingController();
   String _query = '';
-  _CollectionSort _sort = _CollectionSort.newest;
 
   @override
   void initState() {
@@ -857,193 +918,911 @@ class _CollectionScreenState extends State<CollectionScreen> {
     if (mounted) setState(() {});
   }
 
-  String _moneyN(double? v) => v == null ? '—' : '\$${v.toStringAsFixed(2)}';
-
-  bool _matchesQuery(CollectionItem item) {
-    if (_query.isEmpty) return true;
-    final c = item.card;
-    final hay = '${c.name} ${c.setName} ${c.number}'.toLowerCase();
-    return hay.contains(_query);
-  }
-
-  double _itemValue(CollectionItem item) {
-    return item.estimatedMid ??
-        item.marketAtSave ??
-        item.card.bestMarket ??
-        0.0;
-  }
-
-  List<CollectionItem> _filteredSorted(List<CollectionItem> items) {
-    final filtered = items.where(_matchesQuery).toList();
-
-    switch (_sort) {
-      case _CollectionSort.newest:
-        filtered.sort((a, b) => b.addedAt.compareTo(a.addedAt));
-        break;
-      case _CollectionSort.valueHighToLow:
-        filtered.sort((a, b) => _itemValue(b).compareTo(_itemValue(a)));
-        break;
-      case _CollectionSort.nameAZ:
-        filtered.sort(
-          (a, b) =>
-              a.card.name.toLowerCase().compareTo(b.card.name.toLowerCase()),
-        );
-        break;
-    }
-    return filtered;
+  List<SetSummary> _filteredSets(List<SetSummary> sets) {
+    if (_query.isEmpty) return sets;
+    return sets.where((s) {
+      final hay = '${s.setName} ${s.setId ?? ''}'.toLowerCase();
+      return hay.contains(_query);
+    }).toList();
   }
 
   @override
   Widget build(BuildContext context) {
-    final items = _filteredSorted(collectionStore.items);
+    final sets = _filteredSets(collectionStore.getSetSummaries());
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('My Collection'),
+        title: const Text('Collection'),
         actions: [
           IconButton(
             tooltip: 'Clear (testing)',
-            onPressed: items.isEmpty ? null : () => collectionStore.clear(),
+            onPressed: collectionStore.count == 0
+                ? null
+                : () => collectionStore.clear(),
             icon: const Icon(Icons.delete_outline),
           ),
         ],
       ),
-      body: items.isEmpty
-          ? const Center(
-              child: Text(
-                'No cards saved yet.\nSave cards from Pokémon search results.',
-                textAlign: TextAlign.center,
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+            child: TextField(
+              controller: _searchCtrl,
+              decoration: InputDecoration(
+                hintText: 'Search sets...',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _query.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => _searchCtrl.clear(),
+                      ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+            ),
+          ),
+          if (collectionStore.count == 0)
+            const Expanded(
+              child: Center(
+                child: Text(
+                  'No cards saved yet.\nScan a card to start your first set.',
+                  textAlign: TextAlign.center,
+                ),
               ),
             )
-          : Column(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _searchCtrl,
-                          decoration: InputDecoration(
-                            hintText: 'Search your collection...',
-                            prefixIcon: const Icon(Icons.search),
-                            suffixIcon: _query.isEmpty
-                                ? null
-                                : IconButton(
-                                    icon: const Icon(Icons.close),
-                                    onPressed: () => _searchCtrl.clear(),
-                                  ),
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(12),
+          else
+            Expanded(
+              child: ListView.separated(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                itemCount: sets.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 10),
+                itemBuilder: (context, i) {
+                  final s = sets[i];
+                  final total = s.printedTotal ?? 0;
+                  final progressText = (total > 0)
+                      ? '${s.ownedUniqueSlots} / $total'
+                      : '${s.ownedInstances} cards';
+
+                  return Card(
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => SetPokedexScreen(
+                              setKey:
+                                  s.setKey, // ✅ this should be the API set id
+                              setName: s.setName, // ✅ human readable set name
+                              printedTotal: s.printedTotal,
                             ),
                           ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      DropdownButton<_CollectionSort>(
-                        value: _sort,
-                        onChanged: (v) {
-                          if (v == null) return;
-                          setState(() => _sort = v);
-                        },
-                        items: const [
-                          DropdownMenuItem(
-                            value: _CollectionSort.newest,
-                            child: Text('Newest'),
-                          ),
-                          DropdownMenuItem(
-                            value: _CollectionSort.valueHighToLow,
-                            child: Text('Value'),
-                          ),
-                          DropdownMenuItem(
-                            value: _CollectionSort.nameAZ,
-                            child: Text('A–Z'),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        'Cards: ${collectionStore.count}',
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        'Estimated total: ${_moneyN(collectionStore.totalEstimatedValue)}',
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const Divider(height: 1),
-                Expanded(
-                  child: ListView.separated(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: items.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 10),
-                    itemBuilder: (context, i) {
-                      final item = items[i];
-                      final c = item.card;
+                        );
+                      },
 
-                      final estLow = item.estLowAtSave;
-                      final estHigh = item.estHighAtSave;
-                      final market = item.marketAtSave ?? c.bestMarket;
-
-                      final subtitleLines = <String>[
-                        '#${c.number}',
-                        if (item.finish != null && item.finish!.isNotEmpty)
-                          'Finish: ${item.finish}   •   Grade: ${item.userGrade}'
-                        else
-                          'Grade: ${item.userGrade}',
-                        if (estLow != null && estHigh != null)
-                          'Estimate: ${_moneyN(estLow)} – ${_moneyN(estHigh)}'
-                        else
-                          'Market: ${_moneyN(market)}',
-                      ];
-
-                      return Card(
-                        child: ListTile(
-                          leading: c.imageSmall.isEmpty
-                              ? const Icon(Icons.image_not_supported)
-                              : Image.network(
-                                  c.imageSmall,
-                                  width: 56,
-                                  fit: BoxFit.cover,
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    s.setName,
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
                                 ),
-                          title: Text('${c.name} • ${c.setName}'),
-                          subtitle: Text(subtitleLines.join('\n')),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.remove_circle_outline),
-                            onPressed: () =>
-                                collectionStore.removeCardById(c.id),
-                          ),
-                          onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) =>
-                                    PokemonCardDetailsScreen(card: c),
+                                const Icon(Icons.chevron_right),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Row(
+                              children: [
+                                Text(
+                                  progressText,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(99),
+                                    child: LinearProgressIndicator(
+                                      value:
+                                          (s.printedTotal == null ||
+                                              s.printedTotal == 0)
+                                          ? null
+                                          : s.progress,
+                                      minHeight: 10,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              (s.printedTotal == null || s.printedTotal == 0)
+                                  ? 'Tap to view your cards'
+                                  : 'Tap to fill your Pokédex',
+                              style: TextStyle(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurface.withOpacity(0.7),
                               ),
-                            );
-                          },
+                            ),
+                          ],
                         ),
-                      );
-                    },
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ------------------------- SET POKEDEX SCREEN -------------------------
+
+class SetPokedexScreen extends StatefulWidget {
+  final String setKey;
+  final String setName;
+  final int? printedTotal;
+
+  const SetPokedexScreen({
+    super.key,
+    required this.setKey,
+    required this.setName,
+    required this.printedTotal,
+  });
+
+  @override
+  State<SetPokedexScreen> createState() => _SetPokedexScreenState();
+}
+
+class _SetPokedexScreenState extends State<SetPokedexScreen> {
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+
+    collectionStore.addListener(_onChanged);
+
+    // ✅ Preload the set index so missing slots can show the *real* card preview.
+    // In your current architecture, setKey is the setId you use for API calls.
+    // If you later separate them, change setId accordingly.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      collectionStore.ensureSetIndexLoaded(
+        setKey: widget.setKey,
+        setId: widget.setKey,
+      );
+    });
+
+    _searchCtrl.addListener(() {
+      setState(() => _query = _searchCtrl.text.trim().toLowerCase());
+    });
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    collectionStore.removeListener(_onChanged);
+    super.dispose();
+  }
+
+  void _onChanged() {
+    if (mounted) setState(() {});
+  }
+
+  int? _parseInt(String s) => int.tryParse(s);
+
+  @override
+  Widget build(BuildContext context) {
+    final ownedMap = collectionStore.getOwnedSlotMapForSet(widget.setKey);
+
+    // 👇 NEW: previews (slot -> PreviewCard) if the set index is loaded
+    final previewMap = collectionStore.getPreviewSlotMapForSet(widget.setKey);
+
+    // Highest owned number (handles #183 even if printedTotal is 165)
+    final maxOwned = ownedMap.isEmpty
+        ? 0
+        : ownedMap.keys.reduce((a, b) => a > b ? a : b);
+
+    // Total slots we will render
+    final total = (() {
+      final printed = widget.printedTotal ?? 0;
+      final computed = printed > maxOwned ? printed : maxOwned;
+
+      // safety clamp so we don’t accidentally render 5000 tiles if OCR freaks out
+      if (computed > 500) return 500;
+      return computed;
+    })();
+    // ✅ Pokédex completion should be based on the printed set total (no secret rares)
+    final progressTotal = widget.printedTotal ?? total;
+
+    final ownedCount = collectionStore.registeredCountForSet(widget.setKey);
+
+    // Allow bigger grids now that secret rares exist
+    final showGrid = total >= 10 && total <= 500;
+
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.setName)),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+            child: TextField(
+              controller: _searchCtrl,
+              decoration: InputDecoration(
+                hintText: showGrid
+                    ? 'Search # or card name...'
+                    : 'Search your cards...',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: _query.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => _searchCtrl.clear(),
+                      ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    showGrid
+                        ? 'Progress: $ownedCount / $progressTotal'
+                        : 'Cards in set: ${ownedMap.length}',
+                    style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
+                ),
+                if (showGrid)
+                  SizedBox(
+                    width: 140,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(99),
+                      child: LinearProgressIndicator(
+                        value: progressTotal == 0
+                            ? 0
+                            : (ownedCount / progressTotal).clamp(0.0, 1.0),
+
+                        minHeight: 10,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: showGrid
+                ? _buildPokedexGrid(context, total, ownedMap, previewMap)
+                : _buildOwnedList(context, ownedMap),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPokedexGrid(
+    BuildContext context,
+    int total,
+    Map<int, PokemonCardResult> ownedMap,
+    Map<int, PreviewCard> previewMap,
+  ) {
+    final qNum = _parseInt(_query);
+
+    final slots = (qNum != null && qNum >= 1 && qNum <= total)
+        ? <int>[qNum]
+        : List<int>.generate(total, (i) => i + 1);
+
+    return GridView.builder(
+      padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 5, // you said 5 across is done ✅
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: 0.72,
+      ),
+      itemCount: slots.length,
+      itemBuilder: (context, idx) {
+        final slot = slots[idx];
+        final owned = ownedMap[slot];
+        final preview = previewMap[slot];
+
+        if (owned != null) {
+          return _OwnedSlotTile(
+            slot: slot,
+            card: owned,
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => PokemonCardDetailsScreen(card: owned),
+                ),
+              );
+            },
+          );
+        }
+
+        return _MissingSlotTile(
+          slot: slot,
+          previewImageUrl: preview?.imageSmall,
+          previewName: preview?.name,
+          onTap: () => _showSlotSheet(slot: slot, preview: preview),
+        );
+      },
+    );
+  }
+
+  void _showSlotSheet({required int slot, required PreviewCard? preview}) {
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        final title = preview == null
+            ? 'Card #$slot not registered yet'
+            : '${preview.name}  •  #$slot';
+
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Center(
+                child: SizedBox(
+                  height: 150,
+                  child: AspectRatio(
+                    aspectRatio: 0.72,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(14),
+                      child: preview != null && preview.imageSmall.isNotEmpty
+                          ? ColorFiltered(
+                              colorFilter: const ColorFilter.matrix(
+                                _greyMatrix,
+                              ),
+                              child: Image.network(
+                                preview.imageSmall,
+                                fit: BoxFit.cover,
+                              ),
+                            )
+                          : Container(
+                              color: const Color(0xFF1F1F1F),
+                              child: Stack(
+                                children: [
+                                  const Center(
+                                    child: Icon(Icons.style, size: 46),
+                                  ),
+                                  Positioned(
+                                    left: 10,
+                                    top: 10,
+                                    child: Text(
+                                      '#$slot',
+                                      style: const TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                preview == null
+                    ? "Unknown card (preview not loaded yet)."
+                    : "This is the correct card for slot #$slot. Scan it to register this slot.",
+              ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.camera_alt),
+                  label: const Text('Scan this card'),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Next step: wire this button into your scanner flow.',
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  static const List<double> _greyMatrix = <double>[
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+  ];
+
+  Widget _buildOwnedList(
+    BuildContext context,
+    Map<int, PokemonCardResult> ownedMap,
+  ) {
+    final cards = ownedMap.values.toList();
+    final q = _query;
+
+    if (q.isNotEmpty) {
+      cards.removeWhere(
+        (c) => !('${c.name} ${c.number}'.toLowerCase().contains(q)),
+      );
+    }
+
+    if (cards.isEmpty) {
+      return const Center(child: Text('No cards match your search.'));
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(12),
+      itemCount: cards.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 10),
+      itemBuilder: (context, i) {
+        final c = cards[i];
+        return Card(
+          child: ListTile(
+            leading: c.imageSmall.isEmpty
+                ? const Icon(Icons.image_not_supported)
+                : Image.network(c.imageSmall, width: 56, fit: BoxFit.cover),
+            title: Text(c.name),
+            subtitle: Text('#${c.number}'),
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => PokemonCardDetailsScreen(card: c),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+class MissingSlotPreviewScreen extends StatelessWidget {
+  final int slot;
+  final PreviewCard? preview;
+  final String setName;
+
+  const MissingSlotPreviewScreen({
+    super.key,
+    required this.slot,
+    required this.preview,
+    required this.setName,
+  });
+
+  static const List<double> _greyMatrix = <double>[
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final hasPreview =
+        preview != null &&
+        (preview!.imageLarge.isNotEmpty || preview!.imageSmall.isNotEmpty);
+
+    final imgUrl = (preview?.imageLarge.isNotEmpty ?? false)
+        ? preview!.imageLarge
+        : (preview?.imageSmall ?? '');
+
+    return Scaffold(
+      appBar: AppBar(title: Text('Slot #$slot')),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
+        children: [
+          // --- Card preview (grayscale) ---
+          Center(
+            child: SizedBox(
+              height: 420,
+              child: AspectRatio(
+                aspectRatio: 0.72,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(18),
+                  child: hasPreview
+                      ? ColorFiltered(
+                          colorFilter: const ColorFilter.matrix(_greyMatrix),
+                          child: Image.network(imgUrl, fit: BoxFit.cover),
+                        )
+                      : Container(
+                          color: const Color(0xFF1F1F1F),
+                          child: Stack(
+                            children: [
+                              const Center(child: Icon(Icons.style, size: 56)),
+                              Positioned(
+                                left: 14,
+                                top: 14,
+                                child: Text(
+                                  '#$slot',
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                ),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // --- Locked details ---
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: Theme.of(context).dividerColor.withOpacity(0.6),
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  preview == null ? 'Unknown card' : preview!.name,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Set: $setName',
+                  style: TextStyle(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withOpacity(0.75),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Number: #$slot',
+                  style: TextStyle(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withOpacity(0.75),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    const Icon(Icons.lock, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Details stay locked until you register this slot.',
+                        style: TextStyle(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.onSurface.withOpacity(0.75),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // --- Scan button ---
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.camera_alt),
+              label: const Text('Scan this card'),
+              onPressed: () {
+                // STEP 3 will wire this into your camera flow:
+                // capture photo -> RecognizingScreen(photoPath: path) -> auto-register slot
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Next step: wire this button into your scanner flow.',
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Missing tile now supports an optional grayscale preview.
+class _MissingSlotTile extends StatelessWidget {
+  final int slot;
+  final String? previewImageUrl;
+  final String? previewName;
+  final VoidCallback onTap;
+
+  const _MissingSlotTile({
+    required this.slot,
+    required this.onTap,
+    this.previewImageUrl,
+    this.previewName,
+    super.key,
+  });
+
+  static const List<double> _greyMatrix = <double>[
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0.2126,
+    0.7152,
+    0.0722,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final hasPreview = previewImageUrl != null && previewImageUrl!.isNotEmpty;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: onTap,
+      child: Ink(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1C1F26),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: Stack(
+            children: [
+              if (hasPreview)
+                Positioned.fill(
+                  child: Opacity(
+                    opacity: 0.75,
+                    child: ColorFiltered(
+                      colorFilter: const ColorFilter.matrix(_greyMatrix),
+                      child: Image.network(previewImageUrl!, fit: BoxFit.cover),
+                    ),
+                  ),
+                )
+              else
+                const Center(
+                  child: Icon(Icons.style, size: 40, color: Colors.white24),
+                ),
+
+              Positioned(
+                left: 8,
+                top: 8,
+                child: Text(
+                  '$slot',
+                  style: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+              ),
+
+              if (!hasPreview)
+                Positioned(
+                  left: 8,
+                  right: 8,
+                  bottom: 8,
+                  child: Text(
+                    'Missing',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.85),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// ------------------------- SLOT TILE WIDGETS -------------------------
+
+class _OwnedSlotTile extends StatelessWidget {
+  final int slot;
+  final PokemonCardResult card;
+  final VoidCallback onTap;
+
+  const _OwnedSlotTile({
+    required this.slot,
+    required this.card,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: onTap,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: card.imageSmall.isEmpty
+                  ? Container(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.surfaceContainerHighest,
+                      child: const Icon(Icons.image_not_supported),
+                    )
+                  : Image.network(card.imageSmall, fit: BoxFit.cover),
+            ),
+          ),
+          Positioned(
+            left: 8,
+            top: 8,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.55),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                '$slot',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Simple thumbnail widget (keeps CollectionScreen clean)
+class _PreviewThumb extends StatelessWidget {
+  final String url;
+  const _PreviewThumb({required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        width: 40,
+        height: 54,
+        color: Colors.grey.shade200,
+        child: url.isEmpty
+            ? const Icon(Icons.image_not_supported, size: 18)
+            : Image.network(url, fit: BoxFit.cover),
+      ),
+    );
+  }
+}
+
+/// Placeholder for Step 2 (next).
+/// This will become the full “Pokédex grid” set screen.
+class SetDetailScreen extends StatelessWidget {
+  final SetSummary summary;
+  const SetDetailScreen({super.key, required this.summary});
+
+  @override
+  Widget build(BuildContext context) {
+    final items = collectionStore.itemsForSet(summary.setKey);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(summary.setName.isEmpty ? 'Set' : summary.setName),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Progress: ${summary.progressText}',
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Cards in this set: ${items.length}',
+              style: TextStyle(color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Next step: Pokédex grid goes here (tap silhouettes → scan → auto-register).',
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -1340,369 +2119,6 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
   }
 }
 
-class RecognizingScreen extends StatefulWidget {
-  final String photoPath;
-  const RecognizingScreen({super.key, required this.photoPath});
-
-  @override
-  State<RecognizingScreen> createState() => _RecognizingScreenState();
-}
-
-class _RecognizingScreenState extends State<RecognizingScreen> {
-  bool _loading = true;
-  String? _error;
-
-  final _nameCtrl = TextEditingController();
-  final _numCtrl = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    _runAll();
-  }
-
-  @override
-  void dispose() {
-    _nameCtrl.dispose();
-    _numCtrl.dispose();
-    super.dispose();
-  }
-
-  String _cleanOcrName(String raw) {
-    var s = raw;
-
-    // Keep only likely name characters
-    s = s.replaceAll('’', "'").replaceAll(RegExp(r"[^A-Za-z0-9\s\-'']"), ' ');
-
-    // Remove common labels that show on cards
-    s = s.replaceAll(
-      RegExp(r'\b(BASIC|BSIC|STAGE|TRAINER|ENERGY)\b', caseSensitive: false),
-      ' ',
-    );
-
-    // Collapse whitespace
-    s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
-    return s;
-  }
-
-  String _cleanNumber(String raw) {
-    final m = RegExp(r'\d{1,3}').firstMatch(raw);
-    return m?.group(0) ?? raw.trim();
-  }
-
-  Future<void> _runAll() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-
-    String name = '';
-    String? numOnly; // "183"
-    String? setTotalStr; // "165"
-    String? rawNumber; // might be "183/165"
-    int? hp;
-    String? stage;
-
-    try {
-      final guess = await PokemonOcr.recognizeFromImagePath(widget.photoPath);
-
-      name = (guess.name ?? '').trim();
-      rawNumber = (guess.number ?? '').trim();
-      setTotalStr = (guess.setTotal ?? '').trim();
-      hp = guess.hp;
-      stage = guess.stage;
-
-      // If OCR gave "183/165" in number, split it safely
-      if (rawNumber.isNotEmpty) {
-        final parts = rawNumber.split('/');
-        numOnly = parts.first.trim();
-        if ((setTotalStr ?? '').isEmpty && parts.length > 1) {
-          setTotalStr = parts[1].trim();
-        }
-      } else {
-        // fallback
-        final n = (guess.number ?? '').trim();
-        if (n.isNotEmpty) numOnly = n;
-      }
-
-      final hasSlashTotal =
-          rawNumber.contains('/') && rawNumber.split('/').length > 1;
-
-      // normalize empties to null
-      if (numOnly != null && numOnly!.trim().isEmpty) numOnly = null;
-      if (setTotalStr != null && setTotalStr!.trim().isEmpty)
-        setTotalStr = null;
-
-      // ignore: avoid_print
-      print(
-        '🔍 OCR DEBUG → name=$name, rawNumber=$rawNumber, numOnly=$numOnly, setTotal=$setTotalStr, hp=$hp, stage=$stage',
-      );
-
-      final lowerName = name.toLowerCase().trim();
-
-      // If OCR "name" is just a label/category (common on Trainer/Energy cards), ignore it.
-      final looksLikeLabel =
-          lowerName == 'trainer' ||
-          lowerName == 'traner' ||
-          lowerName == 'energy' ||
-          lowerName == 'pokemon';
-
-      // If it looks like a label, don't use name at all.
-      final usedName = looksLikeLabel ? '' : name;
-
-      // ✅ Only trust setTotal if it came from a real "233/236" slash.
-      final String? usedSetTotalStr = hasSlashTotal ? setTotalStr : null;
-
-      // If we have literally nothing useful, go manual
-      final hasSomeInput =
-          usedName.trim().isNotEmpty ||
-          (numOnly != null && numOnly!.isNotEmpty);
-
-      if (!hasSomeInput) {
-        if (!mounted) return;
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const ManualSearchScreen()),
-        );
-        return;
-      }
-
-      try {
-        final api = PokemonTcgApi();
-
-        final pick = await api.searchCardsReliable(
-          name: usedName,
-          number: numOnly,
-          setTotal: usedSetTotalStr,
-        );
-
-        if (!mounted) return;
-
-        // Label-only means: name is useless label, so we searched only by number.
-        final isLabelOnlySearch =
-            looksLikeLabel && usedName.trim().isEmpty && (numOnly != null);
-
-        var results = pick.candidates;
-
-        // If label-only, filter to Trainer/Energy where possible to reduce junk.
-        if (isLabelOnlySearch) {
-          // If the label was trainer-like, prefer Trainers.
-          final wantsTrainer =
-              (lowerName == 'trainer' || lowerName == 'traner');
-          final wantsEnergy = (lowerName == 'energy');
-
-          if (wantsTrainer) {
-            final trainerOnly = results
-                .where((c) => (c.supertype ?? '').toLowerCase() == 'trainer')
-                .toList();
-            if (trainerOnly.isNotEmpty) results = trainerOnly;
-          } else if (wantsEnergy) {
-            final energyOnly = results
-                .where((c) => (c.supertype ?? '').toLowerCase() == 'energy')
-                .toList();
-            if (energyOnly.isNotEmpty) results = energyOnly;
-          }
-
-          // For label-only searches, NEVER auto-pick best (prevents wrong instant jump)
-          if (results.isEmpty) {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(builder: (_) => const ManualSearchScreen()),
-            );
-            return;
-          }
-
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (_) => SearchResultsScreen(
-                type: CardType.pokemon,
-                name: '',
-                set: null,
-                number: numOnly,
-              ),
-            ),
-          );
-          return;
-        }
-
-        // Normal Pokémon scans: if we have a best match, go straight to details
-        if (pick.best != null) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (_) => PokemonCardDetailsScreen(card: pick.best!),
-            ),
-          );
-          return;
-        }
-
-        if (results.isEmpty) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (_) => const ManualSearchScreen()),
-          );
-          return;
-        }
-
-        if (results.length == 1) {
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(
-              builder: (_) => PokemonCardDetailsScreen(card: results[0]),
-            ),
-          );
-          return;
-        }
-
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (_) => SearchResultsScreen(
-              type: CardType.pokemon,
-              name: usedName,
-              set: null,
-              number: numOnly,
-            ),
-          ),
-        );
-      } catch (e, st) {
-        // ignore: avoid_print
-        print('❌ TCG search failed: $e');
-        // ignore: avoid_print
-        print(st);
-
-        if (!mounted) return;
-
-        final msg = e.toString();
-        final isDns =
-            msg.contains('Failed host lookup') ||
-            msg.contains('No address associated with hostname');
-
-        if (isDns) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'No internet/DNS on this device. Check Wi-Fi and try again.',
-              ),
-            ),
-          );
-        }
-
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => const ManualSearchScreen()),
-        );
-      }
-    } catch (e, st) {
-      // ignore: avoid_print
-      print('❌ OCR failed: $e');
-      // ignore: avoid_print
-      print(st);
-
-      if (!mounted) return;
-
-      setState(() {
-        _loading = false;
-        _error = '$e';
-      });
-
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const ManualSearchScreen()),
-      );
-    }
-  }
-
-  void _manualSearch() {
-    final name = _nameCtrl.text.trim();
-    final number = _numCtrl.text.trim();
-
-    if (name.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Type the Pokémon name, then Search.')),
-      );
-      return;
-    }
-
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(
-        builder: (_) => SearchResultsScreen(
-          type: CardType.pokemon,
-          name: name,
-          set: null,
-          number: number.isEmpty ? null : number,
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Recognizing...')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: _loading
-            ? const Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircularProgressIndicator(),
-                    SizedBox(height: 12),
-                    Text('Reading card text...'),
-                  ],
-                ),
-              )
-            : Column(
-                children: [
-                  if (_error != null) ...[
-                    Text('$_error', style: const TextStyle(color: Colors.red)),
-                    const SizedBox(height: 12),
-                  ],
-                  TextField(
-                    controller: _nameCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'Name',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _numCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'Card number (optional)',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _runAll,
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('Retry OCR'),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _manualSearch,
-                          icon: const Icon(Icons.search),
-                          label: const Text('Search'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-      ),
-    );
-  }
-}
-
 class ConditionGuideScreen extends StatelessWidget {
   final int initialGrade;
   const ConditionGuideScreen({super.key, required this.initialGrade});
@@ -1756,6 +2172,275 @@ class ConditionGuideScreen extends StatelessWidget {
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+class RecognizingScreen extends StatefulWidget {
+  final String photoPath;
+  const RecognizingScreen({super.key, required this.photoPath});
+
+  @override
+  State<RecognizingScreen> createState() => _RecognizingScreenState();
+}
+
+class _RecognizingScreenState extends State<RecognizingScreen> {
+  bool _loading = true;
+  String? _error;
+
+  final _nameCtrl = TextEditingController();
+  final _numCtrl = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _runAll();
+  }
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    _numCtrl.dispose();
+    super.dispose();
+  }
+
+  bool _isLabelOnlyName(String name) {
+    final lower = name.trim().toLowerCase();
+    return lower == 'trainer' ||
+        lower == 'traner' ||
+        lower == 'energy' ||
+        lower == 'pokemon';
+  }
+
+  void _goToResults({
+    required String name,
+    String? number,
+    List<PokemonCardResult>? prefetched,
+  }) {
+    final hasSomething =
+        name.trim().isNotEmpty || (number != null && number.trim().isNotEmpty);
+
+    if (!hasSomething) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const ManualSearchScreen()),
+      );
+      return;
+    }
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SearchResultsScreen(
+          type: CardType.pokemon,
+          name: name.trim(),
+          set: null,
+          number: (number != null && number.trim().isNotEmpty)
+              ? number.trim()
+              : null,
+          prefetched: prefetched,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _runAll() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      final guess = await PokemonOcr.recognizeFromImagePath(widget.photoPath);
+
+      var name = (guess.name ?? '').trim();
+      var rawNumber = (guess.number ?? '').trim();
+      var setTotalStr = (guess.setTotal ?? '').trim();
+
+      // Use the real OCR raw text & HP from guess (these exist)
+      final rawText = (guess.rawText ?? '');
+      final hp = guess.hp;
+
+      // Split 183/165 safely if OCR puts both in number
+      String? numOnly;
+      if (rawNumber.isNotEmpty && rawNumber.contains('/')) {
+        final parts = rawNumber.split('/');
+        numOnly = parts.first.trim();
+        if (setTotalStr.isEmpty && parts.length > 1) {
+          setTotalStr = parts[1].trim();
+        }
+      } else {
+        numOnly = rawNumber.isNotEmpty ? rawNumber : null;
+      }
+
+      if (numOnly != null && numOnly.trim().isEmpty) numOnly = null;
+      if (setTotalStr.trim().isEmpty) setTotalStr = '';
+
+      // If OCR "name" is just a label/category, ignore it.
+      final usedName = _isLabelOnlyName(name) ? '' : name;
+
+      // ---- PROMO FIX: try to extract SVP slot from raw OCR text ----
+      // OCR often shows like "G SYPO27" (meant SVP027)
+      final svpSlotDigits = PokemonOcr.extractSvpNumberFromRaw(rawText);
+
+      // If number is missing, use SVP-prefixed number (best for promos)
+      if ((numOnly == null || numOnly.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        numOnly = 'SVP${svpSlotDigits.toString()}';
+      }
+
+      // If we detected SVP, printedTotal for SV promos is 102.
+      // Only apply if setTotal isn't already present.
+      if ((setTotalStr == null || setTotalStr.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        setTotalStr = '102';
+      }
+
+      // ignore: avoid_print
+      print(
+        '🔍 OCR DEBUG → name=$name, number=$numOnly, setTotal=${setTotalStr.isEmpty ? "null" : setTotalStr}, hp=$hp',
+      );
+
+      if ((numOnly == null || numOnly.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        numOnly = 'SVP${svpSlotDigits.toString()}'; // ✅ critical
+      }
+
+      if ((setTotalStr == null || setTotalStr.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        setTotalStr = '102'; // ✅ SV promos printed total
+      }
+
+      final api = PokemonTcgApi();
+      final pick = await api.searchCardsReliable(
+        name: usedName,
+        number: numOnly,
+        setTotal: setTotalStr,
+        hp: hp,
+      );
+
+      if (!mounted) return;
+
+      // If confident best, go straight to details.
+      if (pick.best != null) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => PokemonCardDetailsScreen(card: pick.best!),
+          ),
+        );
+        return;
+      }
+
+      // Otherwise go to results list
+      _goToResults(
+        name: usedName,
+        number: numOnly,
+        prefetched: pick.candidates,
+      );
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('❌ Recognizing failed: $e');
+      // ignore: avoid_print
+      print(st);
+
+      if (!mounted) return;
+
+      setState(() {
+        _error = e.toString();
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+    }
+  }
+
+  void _manualSearch() {
+    final name = _nameCtrl.text.trim();
+    final number = _numCtrl.text.trim();
+
+    if (name.isEmpty && number.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Type a name or number to search.')),
+      );
+      return;
+    }
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SearchResultsScreen(
+          type: CardType.pokemon,
+          name: name,
+          set: null,
+          number: number.isEmpty ? null : number,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Recognizing...')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: _loading
+            ? const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 12),
+                    Text('Reading card text...'),
+                  ],
+                ),
+              )
+            : Column(
+                children: [
+                  if (_error != null) ...[
+                    Text(_error!, style: const TextStyle(color: Colors.red)),
+                    const SizedBox(height: 12),
+                  ],
+                  TextField(
+                    controller: _nameCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Name',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _numCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Card number (optional)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _runAll,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Retry OCR'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: _manualSearch,
+                          icon: const Icon(Icons.search),
+                          label: const Text('Search'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
       ),
     );
   }
