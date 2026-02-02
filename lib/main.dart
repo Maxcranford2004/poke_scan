@@ -15,6 +15,10 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
   await PokemonTcgApi.initCache();
+  collectionStore.seedDemoIfEmpty();
+
+  final api = PokemonTcgApi();
+  api.debugHealthCheck();
 
   final cameras = await availableCameras();
   runApp(CardScanApp(cameras: cameras));
@@ -25,6 +29,30 @@ enum CardType { pokemon, sports }
 extension CardTypeLabel on CardType {
   String get label => this == CardType.pokemon ? 'Pokémon' : 'Sports';
 }
+
+// Shared grayscale matrix (used for “missing/unowned” cards)
+const List<double> kGreyMatrix = <double>[
+  0.2126,
+  0.7152,
+  0.0722,
+  0,
+  0,
+  0.2126,
+  0.7152,
+  0.0722,
+  0,
+  0,
+  0.2126,
+  0.7152,
+  0.0722,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  0,
+];
 
 class CardScanApp extends StatelessWidget {
   final List<CameraDescription> cameras;
@@ -574,12 +602,16 @@ class SearchResultsScreen extends StatefulWidget {
   final String? set;
   final String? number;
 
+  // ✅ NEW
+  final List<PokemonCardResult>? prefetched;
+
   const SearchResultsScreen({
     super.key,
     required this.type,
     required this.name,
     this.set,
     this.number,
+    this.prefetched,
   });
 
   @override
@@ -651,7 +683,17 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+
+    final pre = widget.prefetched;
+    if (pre != null && pre.isNotEmpty) {
+      // Show these immediately; don't run the old cache/live search.
+      _results = pre;
+      _loading = false;
+      _updating = false;
+      _error = null;
+    } else {
+      _load();
+    }
   }
 
   Future<void> _load() async {
@@ -783,11 +825,31 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
                     child: ListTile(
                       leading: c.imageSmall.isEmpty
                           ? const Icon(Icons.image_not_supported)
-                          : Image.network(
-                              c.imageSmall,
-                              width: 56,
-                              fit: BoxFit.cover,
+                          : ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: saved
+                                  ? Image.network(
+                                      c.imageSmall,
+                                      width: 56,
+                                      height: 56,
+                                      fit: BoxFit.cover,
+                                    )
+                                  : ColorFiltered(
+                                      colorFilter: const ColorFilter.matrix(
+                                        kGreyMatrix,
+                                      ),
+                                      child: Opacity(
+                                        opacity: 0.45,
+                                        child: Image.network(
+                                          c.imageSmall,
+                                          width: 56,
+                                          height: 56,
+                                          fit: BoxFit.cover,
+                                        ),
+                                      ),
+                                    ),
                             ),
+
                       title: Text('${c.name} • ${c.setName}'),
                       subtitle: Text('#${c.number}\nTap for details'),
                       isThreeLine: true,
@@ -932,13 +994,15 @@ class _CollectionScreenState extends State<CollectionScreen> {
                           context,
                           MaterialPageRoute(
                             builder: (_) => SetPokedexScreen(
-                              setKey: s.setKey,
-                              setName: s.setName,
+                              setKey:
+                                  s.setKey, // ✅ this should be the API set id
+                              setName: s.setName, // ✅ human readable set name
                               printedTotal: s.printedTotal,
                             ),
                           ),
                         );
                       },
+
                       child: Padding(
                         padding: const EdgeInsets.all(14),
                         child: Column(
@@ -1039,10 +1103,12 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
     // ✅ Preload the set index so missing slots can show the *real* card preview.
     // In your current architecture, setKey is the setId you use for API calls.
     // If you later separate them, change setId accordingly.
-    collectionStore.ensureSetIndexLoaded(
-      setKey: widget.setKey,
-      setId: widget.setKey,
-    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      collectionStore.ensureSetIndexLoaded(
+        setKey: widget.setKey,
+        setId: widget.setKey,
+      );
+    });
 
     _searchCtrl.addListener(() {
       setState(() => _query = _searchCtrl.text.trim().toLowerCase());
@@ -1083,6 +1149,8 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
       if (computed > 500) return 500;
       return computed;
     })();
+    // ✅ Pokédex completion should be based on the printed set total (no secret rares)
+    final progressTotal = widget.printedTotal ?? total;
 
     final ownedCount = collectionStore.registeredCountForSet(widget.setKey);
 
@@ -1121,7 +1189,7 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
                 Expanded(
                   child: Text(
                     showGrid
-                        ? 'Progress: $ownedCount / $total'
+                        ? 'Progress: $ownedCount / $progressTotal'
                         : 'Cards in set: ${ownedMap.length}',
                     style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
@@ -1132,9 +1200,10 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(99),
                       child: LinearProgressIndicator(
-                        value: total == 0
+                        value: progressTotal == 0
                             ? 0
-                            : (ownedCount / total).clamp(0.0, 1.0),
+                            : (ownedCount / progressTotal).clamp(0.0, 1.0),
+
                         minHeight: 10,
                       ),
                     ),
@@ -1620,18 +1689,19 @@ class _MissingSlotTile extends StatelessWidget {
                 ),
               ),
 
-              Positioned(
-                left: 8,
-                right: 8,
-                bottom: 8,
-                child: Text(
-                  'Missing',
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.85),
-                    fontWeight: FontWeight.w700,
+              if (!hasPreview)
+                Positioned(
+                  left: 8,
+                  right: 8,
+                  bottom: 8,
+                  child: Text(
+                    'Missing',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.85),
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
-              ),
             ],
           ),
         ),
@@ -2049,6 +2119,64 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
   }
 }
 
+class ConditionGuideScreen extends StatelessWidget {
+  final int initialGrade;
+  const ConditionGuideScreen({super.key, required this.initialGrade});
+
+  String _label(int g) {
+    if (g >= 10) return "Gem Mint (PSA 10)";
+    if (g == 9) return "Mint (PSA 9)";
+    if (g == 8) return "Near Mint–Mint (PSA 8)";
+    if (g == 7) return "Near Mint (PSA 7)";
+    if (g == 6) return "Excellent–Mint (PSA 6)";
+    if (g == 5) return "Excellent (PSA 5)";
+    if (g == 4) return "Very Good–Excellent (PSA 4)";
+    if (g == 3) return "Very Good (PSA 3)";
+    if (g == 2) return "Good (PSA 2)";
+    return "Poor (PSA 1)";
+  }
+
+  String _desc(int g) {
+    if (g >= 10) return "Perfect corners, edges, surface, and centering.";
+    if (g == 9) return "Almost flawless, tiny imperfections.";
+    if (g == 8) return "Minor whitening or surface wear.";
+    if (g == 7) return "Noticeable whitening, minor scratches/print lines.";
+    if (g == 6)
+      return "Moderate wear, small crease possible, still presentable.";
+    if (g == 5)
+      return "Clear wear, whitening, surface scratches, possible small crease.";
+    if (g == 4) return "Heavy wear, corner rounding, surface damage.";
+    if (g == 3)
+      return "Major wear, creases, edge chipping, strong surface issues.";
+    if (g == 2) return "Severe wear/damage, multiple creases.";
+    return "Very damaged (tears, heavy creasing, ink, etc.).";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Grading Guide")),
+      body: ListView.separated(
+        padding: const EdgeInsets.all(16),
+        itemCount: 10,
+        separatorBuilder: (_, __) => const SizedBox(height: 10),
+        itemBuilder: (context, i) {
+          final g = 10 - i;
+          final selected = g == initialGrade;
+
+          return Card(
+            child: ListTile(
+              title: Text("Grade $g • ${_label(g)}"),
+              subtitle: Text(_desc(g)),
+              trailing: selected ? const Icon(Icons.check_circle) : null,
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
 class RecognizingScreen extends StatefulWidget {
   final String photoPath;
   const RecognizingScreen({super.key, required this.photoPath});
@@ -2085,8 +2213,11 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         lower == 'pokemon';
   }
 
-  void _goToResults({required String name, String? number}) {
-    // If we have absolutely nothing, go manual.
+  void _goToResults({
+    required String name,
+    String? number,
+    List<PokemonCardResult>? prefetched,
+  }) {
     final hasSomething =
         name.trim().isNotEmpty || (number != null && number.trim().isNotEmpty);
 
@@ -2108,6 +2239,7 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
           number: (number != null && number.trim().isNotEmpty)
               ? number.trim()
               : null,
+          prefetched: prefetched,
         ),
       ),
     );
@@ -2119,19 +2251,19 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
       _error = null;
     });
 
-    String name = '';
-    String? rawNumber;
-    String? numOnly;
-    String? setTotalStr;
-
     try {
       final guess = await PokemonOcr.recognizeFromImagePath(widget.photoPath);
 
-      name = (guess.name ?? '').trim();
-      rawNumber = (guess.number ?? '').trim();
-      setTotalStr = (guess.setTotal ?? '').trim();
+      var name = (guess.name ?? '').trim();
+      var rawNumber = (guess.number ?? '').trim();
+      var setTotalStr = (guess.setTotal ?? '').trim();
 
-      // If OCR gave "183/165" in number, split it safely.
+      // Use the real OCR raw text & HP from guess (these exist)
+      final rawText = (guess.rawText ?? '');
+      final hp = guess.hp;
+
+      // Split 183/165 safely if OCR puts both in number
+      String? numOnly;
       if (rawNumber.isNotEmpty && rawNumber.contains('/')) {
         final parts = rawNumber.split('/');
         numOnly = parts.first.trim();
@@ -2142,24 +2274,50 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         numOnly = rawNumber.isNotEmpty ? rawNumber : null;
       }
 
-      if (numOnly != null && numOnly!.trim().isEmpty) numOnly = null;
-      if (setTotalStr.isEmpty) setTotalStr = null;
-
-      // ignore: avoid_print
-      print(
-        '🔍 OCR DEBUG → name=$name, rawNumber=$rawNumber, numOnly=$numOnly, setTotal=$setTotalStr',
-      );
+      if (numOnly != null && numOnly.trim().isEmpty) numOnly = null;
+      if (setTotalStr.trim().isEmpty) setTotalStr = '';
 
       // If OCR "name" is just a label/category, ignore it.
       final usedName = _isLabelOnlyName(name) ? '' : name;
 
-      // Try the API.
+      // ---- PROMO FIX: try to extract SVP slot from raw OCR text ----
+      // OCR often shows like "G SYPO27" (meant SVP027)
+      final svpSlotDigits = PokemonOcr.extractSvpNumberFromRaw(rawText);
+
+      // If number is missing, use SVP-prefixed number (best for promos)
+      if ((numOnly == null || numOnly.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        numOnly = 'SVP${svpSlotDigits.toString()}';
+      }
+
+      // If we detected SVP, printedTotal for SV promos is 102.
+      // Only apply if setTotal isn't already present.
+      if ((setTotalStr == null || setTotalStr.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        setTotalStr = '102';
+      }
+
+      // ignore: avoid_print
+      print(
+        '🔍 OCR DEBUG → name=$name, number=$numOnly, setTotal=${setTotalStr.isEmpty ? "null" : setTotalStr}, hp=$hp',
+      );
+
+      if ((numOnly == null || numOnly.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        numOnly = 'SVP${svpSlotDigits.toString()}'; // ✅ critical
+      }
+
+      if ((setTotalStr == null || setTotalStr.trim().isEmpty) &&
+          svpSlotDigits != null) {
+        setTotalStr = '102'; // ✅ SV promos printed total
+      }
+
       final api = PokemonTcgApi();
       final pick = await api.searchCardsReliable(
         name: usedName,
         number: numOnly,
-        setTotal:
-            setTotalStr, // we’ll pass it; your API can decide how to use it
+        setTotal: setTotalStr,
+        hp: hp,
       );
 
       if (!mounted) return;
@@ -2175,8 +2333,12 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         return;
       }
 
-      // Otherwise ALWAYS go to results list (this is the key change).
-      _goToResults(name: usedName, number: numOnly);
+      // Otherwise go to results list
+      _goToResults(
+        name: usedName,
+        number: numOnly,
+        prefetched: pick.candidates,
+      );
     } catch (e, st) {
       // ignore: avoid_print
       print('❌ Recognizing failed: $e');
@@ -2186,13 +2348,8 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
       if (!mounted) return;
 
       setState(() {
-        _loading = false;
         _error = e.toString();
       });
-
-      // If anything fails (OCR or API), still try to help:
-      // show results if we have something, else manual.
-      _goToResults(name: name, number: numOnly);
     } finally {
       if (mounted) {
         setState(() => _loading = false);
@@ -2284,64 +2441,6 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
                   ),
                 ],
               ),
-      ),
-    );
-  }
-}
-
-class ConditionGuideScreen extends StatelessWidget {
-  final int initialGrade;
-  const ConditionGuideScreen({super.key, required this.initialGrade});
-
-  String _label(int g) {
-    if (g >= 10) return "Gem Mint (PSA 10)";
-    if (g == 9) return "Mint (PSA 9)";
-    if (g == 8) return "Near Mint–Mint (PSA 8)";
-    if (g == 7) return "Near Mint (PSA 7)";
-    if (g == 6) return "Excellent–Mint (PSA 6)";
-    if (g == 5) return "Excellent (PSA 5)";
-    if (g == 4) return "Very Good–Excellent (PSA 4)";
-    if (g == 3) return "Very Good (PSA 3)";
-    if (g == 2) return "Good (PSA 2)";
-    return "Poor (PSA 1)";
-  }
-
-  String _desc(int g) {
-    if (g >= 10) return "Perfect corners, edges, surface, and centering.";
-    if (g == 9) return "Almost flawless, tiny imperfections.";
-    if (g == 8) return "Minor whitening or surface wear.";
-    if (g == 7) return "Noticeable whitening, minor scratches/print lines.";
-    if (g == 6)
-      return "Moderate wear, small crease possible, still presentable.";
-    if (g == 5)
-      return "Clear wear, whitening, surface scratches, possible small crease.";
-    if (g == 4) return "Heavy wear, corner rounding, surface damage.";
-    if (g == 3)
-      return "Major wear, creases, edge chipping, strong surface issues.";
-    if (g == 2) return "Severe wear/damage, multiple creases.";
-    return "Very damaged (tears, heavy creasing, ink, etc.).";
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text("Grading Guide")),
-      body: ListView.separated(
-        padding: const EdgeInsets.all(16),
-        itemCount: 10,
-        separatorBuilder: (_, __) => const SizedBox(height: 10),
-        itemBuilder: (context, i) {
-          final g = 10 - i;
-          final selected = g == initialGrade;
-
-          return Card(
-            child: ListTile(
-              title: Text("Grade $g • ${_label(g)}"),
-              subtitle: Text(_desc(g)),
-              trailing: selected ? const Icon(Icons.check_circle) : null,
-            ),
-          );
-        },
       ),
     );
   }

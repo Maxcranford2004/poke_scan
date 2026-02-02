@@ -65,6 +65,28 @@ class PokemonOcr {
     'box',
   };
 
+  /// Extracts SVP promo number from raw OCR text.
+  /// Handles common OCR mangles like:
+  /// - "SVP027", "SVP 027"
+  /// - "SYPO27" (V→Y, 0→O)
+  /// Returns digits as string (e.g. "27", "51").
+  /// Extracts the SVP promo number as a STRING (e.g. "51") from raw OCR.
+  /// Returns null if not found.
+  static String? extractSvpNumberStringFromRaw(String rawText) {
+    final t = _normalizeDigitsForNumbers(rawText);
+
+    // Match things like "SVP 051", "SVP051", "S V P 051"
+    final m = RegExp(
+      r'\bS\s*V\s*P\s*0*(\d{1,3})\b',
+      caseSensitive: false,
+    ).firstMatch(t);
+    if (m == null) return null;
+
+    final s = m.group(1);
+    if (s == null) return null;
+    return int.tryParse(s)?.toString(); // normalize "051" -> "51"
+  }
+
   // ---------- Text normalization ----------
   static String _deaccent(String s) {
     return s
@@ -304,6 +326,7 @@ class PokemonOcr {
   static int? _extractHp(String raw) {
     final t = _normalizeDigitsForNumbers(raw);
 
+    // 1) Strong matches: "HP 150" or "150 HP"
     final m1 = RegExp(
       r'\bHP\s*(\d{2,3})\b',
       caseSensitive: false,
@@ -316,21 +339,67 @@ class PokemonOcr {
     ).firstMatch(t);
     if (m2 != null) return int.tryParse(m2.group(1)!);
 
+    // 2) Spaced letters: "H P 150"
     final m3 = RegExp(
       r'\bH\s*P\s*(\d{2,3})\b',
       caseSensitive: false,
     ).firstMatch(t);
     if (m3 != null) return int.tryParse(m3.group(1)!);
 
-    // conservative fallback: first plausible HP number
-    final nums = RegExp(r'\b(\d{2,3})\b')
-        .allMatches(t)
-        .map((m) => int.tryParse(m.group(1)!))
-        .whereType<int>()
-        .toList();
+    // 3) Heuristic fallback (when OCR misses "HP"):
+    // - HP is usually one of the largest numbers on the card
+    // - attack text often includes "does 80 damage" etc.
+    // - HP tends to appear near the bottom alongside weakness/retreat/resistance
+    final lower = t.toLowerCase();
+    final matches = RegExp(r'\b(\d{2,3})\b').allMatches(t).toList();
 
-    final plausible = nums.where((n) => n >= 40 && n <= 340).toList();
-    return plausible.isEmpty ? null : plausible.first;
+    int? best;
+    double bestScore = -1;
+
+    for (final m in matches) {
+      final s = m.group(1);
+      final n = (s == null) ? null : int.tryParse(s);
+      if (n == null) continue;
+      if (n < 40 || n > 340) continue;
+
+      final start = m.start;
+      final end = m.end;
+
+      // Context window around the number
+      final left = (start - 25 < 0) ? 0 : start - 25;
+      final right = (end + 25 > lower.length) ? lower.length : end + 25;
+      final ctx = lower.substring(left, right);
+
+      // Hard reject: looks like attack damage
+      // (covers: "does 80 damage", "do 80 damage", "80 damage to itself", etc.)
+      if (ctx.contains('damage') ||
+          ctx.contains('does $n') ||
+          ctx.contains('do $n')) {
+        continue;
+      }
+
+      // Prefer numbers near bottom (HP/weakness/retreat area tends to be later)
+      final pos = start / lower.length; // 0..1
+      double score = 0;
+
+      // Base: prefer larger numbers (HP often larger than attack numbers)
+      score += n / 340.0;
+
+      // Boost if appears late in the text
+      score += pos;
+
+      // Boost if nearby weakness/resistance/retreat (common near HP line)
+      if (ctx.contains('weak')) score += 0.7;
+      if (ctx.contains('resist')) score += 0.5;
+      if (ctx.contains('retreat')) score += 0.5;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = n;
+      }
+    }
+
+    return best;
   }
 
   static String? _extractStage(String raw) {
@@ -615,6 +684,14 @@ class PokemonOcr {
 
       final frac = _pickBestCollectorFraction(lineBoxes, raw);
       final hp = _extractHp(raw);
+      print('🧩 HP DEBUG raw.len=${raw.length}');
+      print(
+        '🧩 HP DEBUG raw.head="${raw.substring(0, raw.length > 180 ? 180 : raw.length)}"',
+      );
+      print('🧩 HP DEBUG extractedHp=$hp');
+      ;
+      final svpSlot = PokemonOcr.extractSvpNumberFromRaw(raw);
+
       final stage = _extractStage(raw);
 
       // Name priority: near HP first, then scored top/fallback
@@ -652,6 +729,14 @@ class PokemonOcr {
     } finally {
       await recognizer.close();
     }
+  }
+
+  /// Extracts the SVP promo number as an INT (e.g. 51) from raw OCR.
+  /// Returns null if not found.
+  static int? extractSvpNumberFromRaw(String rawText) {
+    final s = extractSvpNumberStringFromRaw(rawText);
+    if (s == null) return null;
+    return int.tryParse(s);
   }
 }
 

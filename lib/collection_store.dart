@@ -151,6 +151,36 @@ class CollectionStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Dev helper: lets you see the Collection UI without scanning.
+  /// Call once on app start. Only seeds if empty.
+  void seedDemoIfEmpty() {
+    if (_entries.isNotEmpty) return;
+
+    final demoCard = PokemonCardResult(
+      id: 'demo-card-1',
+      name: 'Demo Card',
+      setName: 'Demo Set',
+      setId: 'demo-set',
+      number: '1',
+      setPrintedTotal: 94,
+
+      // Images can be any valid https image. Use a tiny placeholder.
+      imageSmall: 'https://via.placeholder.com/200x280.png?text=Demo',
+      imageLarge: 'https://via.placeholder.com/600x840.png?text=Demo',
+
+      // finishes is required by your model
+      finishes: const <String, PriceRow>{},
+
+      // Optional
+      tcgplayerUrl: null,
+      hp: null,
+      supertype: 'Pokémon',
+      subtypes: const [],
+    );
+
+    addCard(demoCard);
+  }
+
   // ---------------- main.dart expects these ----------------
 
   List<CollectionEntry> itemsForSet(String setKey) {
@@ -259,33 +289,67 @@ class CollectionStore extends ChangeNotifier {
     required String setId,
   }) async {
     if (_setIndex.containsKey(setKey) || _loadingSetIndex.contains(setKey)) {
+      // ignore: avoid_print
+      print(
+        '🧩 ensureSetIndexLoaded SKIP → already loaded/loading (setKey=$setKey)',
+      );
       return;
     }
+
     _loadingSetIndex.add(setKey);
+    // ignore: avoid_print
+    print('🧩 ensureSetIndexLoaded START → setKey=$setKey setId=$setId');
 
     try {
       if (setId.trim().isEmpty) {
+        // ignore: avoid_print
+        print('🧩 ensureSetIndexLoaded ABORT → empty setId');
         _setIndex[setKey] = {};
         return;
       }
 
       final api = PokemonTcgApi();
+
+      // ignore: avoid_print
+      print('🧩 fetching set index from API… (setId=$setId)');
       final cards = await api.fetchAllCardsForSet(setId);
+      // ignore: avoid_print
+      print('🧩 fetched ${cards.length} cards for setId=$setId');
 
       final map = <int, PokemonCardResult>{};
+      var skippedNonNumeric = 0;
+
       for (final c in cards) {
         final digits = c.number.replaceAll(RegExp(r'[^0-9]'), '');
         final n = int.tryParse(digits);
-        if (n == null) continue;
-
-        // keep first seen for that slot
+        if (n == null) {
+          skippedNonNumeric++;
+          continue;
+        }
         map.putIfAbsent(n, () => c);
       }
 
       _setIndex[setKey] = map;
+
+      // ignore: avoid_print
+      print(
+        '🧩 index READY → slotsIndexed=${map.length} skippedNonNumeric=$skippedNonNumeric (setKey=$setKey)',
+      );
+
+      notifyListeners();
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('❌ ensureSetIndexLoaded FAILED → $e');
+      // ignore: avoid_print
+      print(st);
+
+      // still set empty so UI stops saying “preview not loaded yet”
+      _setIndex[setKey] = {};
       notifyListeners();
     } finally {
       _loadingSetIndex.remove(setKey);
+      // ignore: avoid_print
+      print('🧩 ensureSetIndexLoaded END → setKey=$setKey');
     }
   }
 
