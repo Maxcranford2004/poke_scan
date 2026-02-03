@@ -172,9 +172,9 @@ class PokemonCardResult {
     }
 
     // set info: flattened OR nested
-    String setName = (json['setName'] ?? '').toString();
-    String setId = (json['setId'] ?? '').toString();
-    int? setPrintedTotal = i(json['setPrintedTotal']);
+    String setName = (json['setName'] ?? json['set_name'] ?? '').toString();
+    String setId = (json['setId'] ?? json['set_id'] ?? '').toString();
+    int? setPrintedTotal = i(json['setPrintedTotal'] ?? json['printed_total']);
 
     final setObj = json['set'];
     if (setObj is Map) {
@@ -184,8 +184,10 @@ class PokemonCardResult {
     }
 
     // images: flattened OR nested
-    String imageSmall = (json['imageSmall'] ?? '').toString();
-    String imageLarge = (json['imageLarge'] ?? '').toString();
+    String imageSmall = (json['imageSmall'] ?? json['image_small'] ?? '')
+        .toString();
+    String imageLarge = (json['imageLarge'] ?? json['image_large'] ?? '')
+        .toString();
 
     final imagesObj = json['images'];
     if (imagesObj is Map) {
@@ -205,7 +207,7 @@ class PokemonCardResult {
       id: (json['id'] ?? '').toString(),
       name: (json['name'] ?? '').toString(),
       setName: setName,
-      setId: setId, // non-null now
+      setId: setId,
       setPrintedTotal: setPrintedTotal,
       number: (json['number'] ?? '').toString(),
       hp: i(json['hp']),

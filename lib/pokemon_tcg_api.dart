@@ -48,12 +48,14 @@ class PokemonTcgApi {
   static const String _host = 'api.pokemontcg.io';
   static const String _cardsPath = '/v2/cards';
   static const String _cacheBoxName = 'tcg_cache_v2';
+
+  // ✅ Use ONE proxy base consistently
   static const String _proxyBase =
       'https://poke-tcg-proxy.maximocran.workers.dev';
 
   static Box? _cacheBox;
 
-  // One client for consistency
+  // One client for consistency (direct API only)
   late final IOClient _io = _makeClient();
 
   IOClient _makeClient() {
@@ -110,7 +112,7 @@ class PokemonTcgApi {
   }
 
   Uri _proxyUri(String path, Map<String, String> qp) {
-    final base = Uri.parse(kPokeTcgProxyBase);
+    final base = Uri.parse(_proxyBase);
     return base.replace(path: path, queryParameters: qp);
   }
 
@@ -124,7 +126,7 @@ class PokemonTcgApi {
       try {
         final resp = await http
             .get(uri)
-            .timeout(const Duration(seconds: 45)); // ✅ was 20
+            .timeout(const Duration(seconds: 45)); // ✅
 
         final body = resp.body;
         if (resp.statusCode != 200) {
@@ -254,7 +256,7 @@ class PokemonTcgApi {
       try {
         var reqUri = uri;
 
-        // --- sanitize known ghost typos right before sending ---
+        // sanitize known ghost typos right before sending
         final qp = Map<String, String>.from(reqUri.queryParameters);
         final ob = qp['orderBy'];
         if (ob != null) {
@@ -395,7 +397,7 @@ class PokemonTcgApi {
     await _box.put(key, body);
   }
 
-  // ------------------- Set index (disabled from app for now) -------------------
+  // ------------------- Set index -------------------
 
   Future<List<PokemonCardResult>> fetchAllCardsForSet(String setId) async {
     final cacheKey = 'setindex|$setId';
@@ -406,7 +408,7 @@ class PokemonTcgApi {
       } catch (_) {}
     }
 
-    // ✅ Prefer Worker D1 set-index for Pokédex previews (works even when direct API is disabled)
+    // ✅ Prefer Worker D1 set-index for Pokédex previews
     try {
       final uri = Uri.parse('$_proxyBase/set-index?setId=$setId');
       final resp = await http.get(uri);
@@ -420,7 +422,6 @@ class PokemonTcgApi {
               .map((e) => Map<String, dynamic>.from(e as Map))
               .toList();
 
-          // Convert worker rows -> PokemonCardResult
           final cards = raw.map((r) {
             return PokemonCardResult.fromJson({
               'id': r['id'],
@@ -435,10 +436,8 @@ class PokemonTcgApi {
             });
           }).toList();
 
-          // Cache it in the same format your parser expects
           final wrapped = {'data': cards.map((c) => c.toJson()).toList()};
           await _box.put(cacheKey, jsonEncode(wrapped));
-
           return cards;
         }
       }
@@ -446,7 +445,6 @@ class PokemonTcgApi {
       // fall through
     }
 
-    // If direct API is disabled and worker didn't return, return empty.
     if (kDisableDirectTcgApi) {
       return <PokemonCardResult>[];
     }
@@ -488,7 +486,7 @@ class PokemonTcgApi {
     return <PokemonCardResult>[];
   }
 
-  // ------------------- Search (direct upstream, mostly disabled) -------------------
+  // ------------------- Search (direct upstream) -------------------
 
   Future<List<PokemonCardResult>> refreshSearch({
     required String name,
@@ -506,16 +504,14 @@ class PokemonTcgApi {
     final hasNumber = cleanNum != null && cleanNum.isNotEmpty;
     if (!hasName && !hasNumber) return <PokemonCardResult>[];
 
-    // If direct is disabled, use cached-only.
     if (kDisableDirectTcgApi) {
-      final cached = await getCachedSearch(
+      return getCachedSearch(
         name: name,
         set: set,
         number: number,
         setTotal: setTotal,
         pageSize: pageSize,
       );
-      return cached;
     }
 
     final parts = <String>[];
@@ -537,7 +533,6 @@ class PokemonTcgApi {
     if (hasNumber) {
       final variants = <String>[];
       var base = cleanNum!.trim();
-
       if (base.contains('/')) base = base.split('/').first.trim();
 
       final hasLetters = RegExp(r'[A-Za-z]').hasMatch(base);
@@ -546,7 +541,7 @@ class PokemonTcgApi {
         final digitsOnly = base.replaceAll(RegExp(r'[^0-9]'), '');
         if (digitsOnly.isNotEmpty) variants.add(digitsOnly);
       } else {
-        var digits = base.replaceAll(RegExp(r'[^0-9]'), '');
+        final digits = base.replaceAll(RegExp(r'[^0-9]'), '');
         if (digits.isNotEmpty) base = digits;
 
         variants.add(base);
@@ -579,7 +574,7 @@ class PokemonTcgApi {
     }
 
     // ignore: avoid_print
-    print('✅ USING RELEASEDATE (fingerprint v1) orderBy=-set.releaseDate');
+    print('✅ USING RELEASEDATE orderBy=-set.releaseDate');
 
     final q = parts.join(' ');
     final uri = Uri.https(_host, _cardsPath, {
@@ -626,9 +621,8 @@ class PokemonTcgApi {
         if (card != null) return card;
       } catch (_) {}
     }
-    if (kDisableDirectTcgApi) {
-      return null;
-    }
+
+    if (kDisableDirectTcgApi) return null;
 
     final uri = Uri.https(_host, '$_cardsPath/$id');
     final resp = await _get(uri);
@@ -641,15 +635,20 @@ class PokemonTcgApi {
   // ------------------- Worker scan lookup -------------------
 
   PokemonCardResult _fromWorkerRow(Map<String, dynamic> row) {
+    int? toInt(dynamic v) {
+      if (v == null) return null;
+      if (v is int) return v;
+      return int.tryParse(v.toString());
+    }
+
     return PokemonCardResult(
       id: (row['id'] ?? '').toString(),
       name: (row['name'] ?? '').toString(),
       setId: (row['set_id'] ?? '').toString(),
       setName: (row['set_name'] ?? '').toString(),
-      setPrintedTotal: row['printed_total'] is int
-          ? row['printed_total'] as int
-          : int.tryParse('${row['printed_total']}'),
+      setPrintedTotal: toInt(row['printed_total']),
       number: (row['number'] ?? '').toString(),
+      hp: toInt(row['hp']), // ✅ THIS is where hp belongs
       imageSmall: (row['image_small'] ?? '').toString(),
       imageLarge: (row['image_large'] ?? '').toString(),
       finishes: const {},
@@ -661,25 +660,34 @@ class PokemonTcgApi {
     String? number,
     String? setTotal,
     int? hp,
+    String? expectedSetId,
+    int? expectedSlot,
   }) async {
     final cleanedName = _cleanName(name);
     final num = _cleanCollectorNumber(number);
     final total = _parseSetTotal(setTotal);
 
-    // If we truly have nothing usable, bail.
     if (cleanedName.isEmpty && num == null) return null;
 
-    // Build qp safely (no undefined vars)
     final qp = <String, String>{};
     if (cleanedName.isNotEmpty) qp['name'] = cleanedName;
     if (num != null) qp['number'] = num;
     if (total != null) qp['printedTotal'] = total.toString();
-    if (hp != null && hp > 0) qp['hp'] = hp.toString(); // ✅
+    if (hp != null && hp > 0) qp['hp'] = hp.toString();
+
+    // ✅ slot-locked params
+    if (expectedSetId != null && expectedSetId.trim().isNotEmpty) {
+      qp['expectedSetId'] = expectedSetId.trim();
+    }
+    if (expectedSlot != null) {
+      qp['expectedSlot'] = expectedSlot.toString();
+    }
 
     final uri = _proxyUri('/scan-lookup', qp);
     final j = await _proxyGetJson(uri);
 
     if (j['ok'] != true) return null;
+
     if (j['found'] != true) {
       return ReliablePick(
         best: null,
@@ -690,9 +698,9 @@ class PokemonTcgApi {
 
     final confident = j['confident'] == true;
 
-    final bestRowAny = j['best'];
-    if (bestRowAny is! Map) return null;
-    final best = _fromWorkerRow(bestRowAny.cast<String, dynamic>());
+    final bestAny = j['best'];
+    if (bestAny is! Map) return null;
+    final best = _fromWorkerRow(bestAny.cast<String, dynamic>());
 
     if (confident) {
       return ReliablePick(
@@ -724,14 +732,24 @@ class PokemonTcgApi {
     String? number,
     String? setTotal,
     int? hp,
-    String? stage,
+
+    // ✅ optional (slot locked scans from Pokédex)
+    String? expectedSetId,
+    int? expectedSlot,
     int? svpSlot,
   }) async {
     final safeName = _cleanName(name);
     final lowerName = safeName.toLowerCase().trim();
     final wantNum = _cleanCollectorNumber(number);
-    // SVP fast-path: if we have an SVP slot hint and no collector number, use /preview
-    if (svpSlot != null && (number == null || number.trim().isEmpty)) {
+
+    final isLabel =
+        lowerName == 'trainer' ||
+        lowerName == 'traner' ||
+        lowerName == 'pokemon' ||
+        lowerName == 'energy';
+    // ✅ SVP promo fast-path:
+    // If OCR detected an SVP slot (like "SVP 027"), fetch the exact promo from /preview.
+    if (svpSlot != null && svpSlot > 0) {
       try {
         final uri = _proxyUri('/preview', {
           'setId': 'svp',
@@ -739,17 +757,15 @@ class PokemonTcgApi {
         });
 
         final j = await _proxyGetJson(uri);
-
-        if (j['ok'] == true && j['found'] == true) {
-          final cardAny = j['card'];
-          if (cardAny is Map) {
-            final card = _fromWorkerRow(cardAny.cast<String, dynamic>());
-            return ReliablePick(
-              best: card,
-              candidates: const [],
-              strategy: 'svp-preview',
-            );
-          }
+        if (j['ok'] == true && j['found'] == true && j['card'] is Map) {
+          final card = _fromWorkerRow(
+            (j['card'] as Map).cast<String, dynamic>(),
+          );
+          return ReliablePick(
+            best: card,
+            candidates: const [],
+            strategy: 'svp-preview',
+          );
         }
       } catch (e) {
         // ignore: avoid_print
@@ -757,31 +773,20 @@ class PokemonTcgApi {
       }
     }
 
-    final isLabel =
-        lowerName == 'trainer' ||
-        lowerName == 'traner' ||
-        lowerName == 'pokemon' ||
-        lowerName == 'energy';
-
-    // Worker-first: if this returns anything, stop.
-    // If OCR didn't find a collector number, try SVP promo hint
-    if ((number == null || number.trim().isEmpty) && safeName.isNotEmpty) {
-      // You need to pass svpSlot into this method (see note below),
-      // OR re-detect it from the OCR raw text before calling searchCardsReliable.
-    }
-
+    // ✅ WORKER FIRST (includes slot-locked behavior)
     try {
       final proxyPick = await _scanLookupViaProxy(
         name: name,
         number: number,
         setTotal: setTotal,
         hp: hp,
+        expectedSetId: expectedSetId,
+        expectedSlot: expectedSlot,
       );
       if (proxyPick != null) return proxyPick;
     } catch (e) {
       // ignore: avoid_print
       print('⚠️ proxy scan-lookup failed: $e');
-      // fall through
     }
 
     // If label-only and no number, nothing useful
@@ -793,7 +798,7 @@ class PokemonTcgApi {
       );
     }
 
-    // Everything below is only useful if direct API is enabled.
+    // Everything below is direct API only
     if (kDisableDirectTcgApi) {
       return ReliablePick(
         best: null,

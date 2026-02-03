@@ -731,12 +731,31 @@ class PokemonOcr {
     }
   }
 
-  /// Extracts the SVP promo number as an INT (e.g. 51) from raw OCR.
-  /// Returns null if not found.
-  static int? extractSvpNumberFromRaw(String rawText) {
-    final s = extractSvpNumberStringFromRaw(rawText);
-    if (s == null) return null;
-    return int.tryParse(s);
+  /// Tries to detect Scarlet & Violet promo slot from raw OCR text.
+  /// Example OCR junk: "G SYPO27" meaning "SVP 027"
+  static int? extractSvpNumberFromRaw(String raw) {
+    final t = raw.toUpperCase();
+
+    // Common OCR variants that should count as "SVP"
+    // Examples seen: "SYPO27", "SVPO27", "S V P 027", "SVP027"
+    final patterns = <RegExp>[
+      RegExp(r'\bS\s*V\s*P\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSVP\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSYP\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSYPO\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSVPO\s*0*([0-9]{1,3})\b'),
+      // catches cases like "G SYPO27" (junk before it)
+      RegExp(r'\b(?:SVP|SYP|SYPO|SVPO)\s*0*([0-9]{1,3})\b'),
+    ];
+
+    for (final re in patterns) {
+      final m = re.firstMatch(t);
+      if (m != null) {
+        final n = int.tryParse(m.group(1)!);
+        if (n != null && n >= 1 && n <= 102) return n;
+      }
+    }
+    return null;
   }
 }
 

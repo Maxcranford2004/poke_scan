@@ -11,6 +11,7 @@ import 'package:image_picker/image_picker.dart';
 import 'pokemon_models.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
+List<CameraDescription> gCameras = const [];
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
@@ -21,6 +22,7 @@ Future<void> main() async {
   api.debugHealthCheck();
 
   final cameras = await availableCameras();
+  gCameras = cameras;
   runApp(CardScanApp(cameras: cameras));
 }
 
@@ -257,7 +259,19 @@ class HomeScreen extends StatelessWidget {
 
 class ScanScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
-  const ScanScreen({super.key, required this.cameras});
+
+  // ✅ add these
+  final String? expectedSetId;
+  final int? expectedSlot;
+
+  const ScanScreen({
+    super.key,
+    required this.cameras,
+
+    // ✅ optional named params
+    this.expectedSetId,
+    this.expectedSlot,
+  });
 
   @override
   State<ScanScreen> createState() => _ScanScreenState();
@@ -315,7 +329,11 @@ class _ScanScreenState extends State<ScanScreen> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => RecognizingScreen(photoPath: file.path),
+        builder: (_) => RecognizingScreen(
+          photoPath: file.path,
+          expectedSetId: widget.expectedSetId,
+          expectedSlot: widget.expectedSlot,
+        ),
       ),
     );
   }
@@ -329,7 +347,11 @@ class _ScanScreenState extends State<ScanScreen> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => RecognizingScreen(photoPath: file.path),
+        builder: (_) => RecognizingScreen(
+          photoPath: file.path,
+          expectedSetId: widget.expectedSetId,
+          expectedSlot: widget.expectedSlot,
+        ),
       ),
     );
   }
@@ -339,7 +361,13 @@ class _ScanScreenState extends State<ScanScreen> {
     final controller = _controller;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Scan')),
+      appBar: AppBar(
+        title: Text(
+          widget.expectedSetId != null && widget.expectedSlot != null
+              ? 'Scan #${widget.expectedSlot} (${widget.expectedSetId})'
+              : 'Scan',
+        ),
+      ),
       body: controller == null
           ? const Center(child: Text('No camera found on this device/emulator'))
           : FutureBuilder<void>(
@@ -993,10 +1021,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
                         Navigator.push(
                           context,
                           MaterialPageRoute(
+                            settings: const RouteSettings(name: 'set_pokedex'),
                             builder: (_) => SetPokedexScreen(
-                              setKey:
-                                  s.setKey, // ✅ this should be the API set id
-                              setName: s.setName, // ✅ human readable set name
+                              setKey: s.setKey,
+                              setName: s.setName,
                               printedTotal: s.printedTotal,
                             ),
                           ),
@@ -1094,15 +1122,36 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
   final _searchCtrl = TextEditingController();
   String _query = '';
 
+  // ✅ Celebration overlay state
+  CollectedEvent? _celebrate;
+  bool _showCelebrate = false;
+
+  void _onCollectedEvent() {
+    final e = collectionStore.lastCollected.value;
+    if (e == null) return;
+
+    // Only celebrate events for THIS set screen
+    if (e.setKey != widget.setKey) return;
+
+    setState(() {
+      _celebrate = e;
+      _showCelebrate = true;
+    });
+
+    Future.delayed(const Duration(seconds: 4), () {
+      if (!mounted) return;
+      setState(() => _showCelebrate = false);
+    });
+  }
+
   @override
   void initState() {
     super.initState();
 
     collectionStore.addListener(_onChanged);
+    collectionStore.lastCollected.addListener(_onCollectedEvent);
 
     // ✅ Preload the set index so missing slots can show the *real* card preview.
-    // In your current architecture, setKey is the setId you use for API calls.
-    // If you later separate them, change setId accordingly.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       collectionStore.ensureSetIndexLoaded(
         setKey: widget.setKey,
@@ -1119,6 +1168,7 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
   void dispose() {
     _searchCtrl.dispose();
     collectionStore.removeListener(_onChanged);
+    collectionStore.lastCollected.removeListener(_onCollectedEvent);
     super.dispose();
   }
 
@@ -1131,92 +1181,92 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
   @override
   Widget build(BuildContext context) {
     final ownedMap = collectionStore.getOwnedSlotMapForSet(widget.setKey);
-
-    // 👇 NEW: previews (slot -> PreviewCard) if the set index is loaded
     final previewMap = collectionStore.getPreviewSlotMapForSet(widget.setKey);
 
-    // Highest owned number (handles #183 even if printedTotal is 165)
     final maxOwned = ownedMap.isEmpty
         ? 0
         : ownedMap.keys.reduce((a, b) => a > b ? a : b);
 
-    // Total slots we will render
     final total = (() {
       final printed = widget.printedTotal ?? 0;
       final computed = printed > maxOwned ? printed : maxOwned;
-
-      // safety clamp so we don’t accidentally render 5000 tiles if OCR freaks out
       if (computed > 500) return 500;
       return computed;
     })();
-    // ✅ Pokédex completion should be based on the printed set total (no secret rares)
+
+    // ✅ Completion based on printedTotal (no secret rares)
     final progressTotal = widget.printedTotal ?? total;
 
     final ownedCount = collectionStore.registeredCountForSet(widget.setKey);
-
-    // Allow bigger grids now that secret rares exist
     final showGrid = total >= 10 && total <= 500;
 
     return Scaffold(
       appBar: AppBar(title: Text(widget.setName)),
-      body: Column(
+      body: Stack(
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-            child: TextField(
-              controller: _searchCtrl,
-              decoration: InputDecoration(
-                hintText: showGrid
-                    ? 'Search # or card name...'
-                    : 'Search your cards...',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.close),
-                        onPressed: () => _searchCtrl.clear(),
-                      ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    showGrid
-                        ? 'Progress: $ownedCount / $progressTotal'
-                        : 'Cards in set: ${ownedMap.length}',
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                ),
-                if (showGrid)
-                  SizedBox(
-                    width: 140,
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(99),
-                      child: LinearProgressIndicator(
-                        value: progressTotal == 0
-                            ? 0
-                            : (ownedCount / progressTotal).clamp(0.0, 1.0),
-
-                        minHeight: 10,
-                      ),
+          Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+                child: TextField(
+                  controller: _searchCtrl,
+                  decoration: InputDecoration(
+                    hintText: showGrid
+                        ? 'Search # or card name...'
+                        : 'Search your cards...',
+                    prefixIcon: const Icon(Icons.search),
+                    suffixIcon: _query.isEmpty
+                        ? null
+                        : IconButton(
+                            icon: const Icon(Icons.close),
+                            onPressed: () => _searchCtrl.clear(),
+                          ),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
                     ),
                   ),
-              ],
-            ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        showGrid
+                            ? 'Progress: $ownedCount / $progressTotal'
+                            : 'Cards in set: ${ownedMap.length}',
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    if (showGrid)
+                      SizedBox(
+                        width: 140,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(99),
+                          child: LinearProgressIndicator(
+                            value: progressTotal == 0
+                                ? 0
+                                : (ownedCount / progressTotal).clamp(0.0, 1.0),
+                            minHeight: 10,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: showGrid
+                    ? _buildPokedexGrid(context, total, ownedMap, previewMap)
+                    : _buildOwnedList(context, ownedMap),
+              ),
+            ],
           ),
-          const Divider(height: 1),
-          Expanded(
-            child: showGrid
-                ? _buildPokedexGrid(context, total, ownedMap, previewMap)
-                : _buildOwnedList(context, ownedMap),
-          ),
+
+          // ✅ Celebration overlay
+          if (_showCelebrate && _celebrate != null)
+            Positioned.fill(child: _CollectedOverlay(event: _celebrate!)),
         ],
       ),
     );
@@ -1237,7 +1287,7 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
     return GridView.builder(
       padding: const EdgeInsets.all(12),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 5, // you said 5 across is done ✅
+        crossAxisCount: 5,
         mainAxisSpacing: 10,
         crossAxisSpacing: 10,
         childAspectRatio: 0.72,
@@ -1352,10 +1402,14 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
                   label: const Text('Scan this card'),
                   onPressed: () {
                     Navigator.pop(ctx);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text(
-                          'Next step: wire this button into your scanner flow.',
+
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => ScanScreen(
+                          cameras: gCameras,
+                          expectedSetId: widget.setKey,
+                          expectedSlot: slot,
                         ),
                       ),
                     );
@@ -1433,6 +1487,120 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+class _CollectedOverlay extends StatefulWidget {
+  final CollectedEvent event;
+  const _CollectedOverlay({required this.event});
+
+  @override
+  State<_CollectedOverlay> createState() => _CollectedOverlayState();
+}
+
+class _CollectedOverlayState extends State<_CollectedOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..forward();
+
+  late final Animation<double> _fade = CurvedAnimation(
+    parent: _c,
+    curve: Curves.easeOut,
+  );
+  late final Animation<double> _scale = CurvedAnimation(
+    parent: _c,
+    curve: Curves.easeOutBack,
+  );
+  late final Animation<double> _registeredIn = CurvedAnimation(
+    parent: _c,
+    curve: const Interval(0.35, 1.0, curve: Curves.easeOutBack),
+  );
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final e = widget.event;
+
+    return IgnorePointer(
+      child: Container(
+        color: Colors.black.withOpacity(0.55),
+        child: Center(
+          child: FadeTransition(
+            opacity: _fade,
+            child: ScaleTransition(
+              scale: _scale,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(18),
+                    child: Image.network(
+                      e.imageUrl,
+                      height: 260,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+
+                  FadeTransition(
+                    opacity: _registeredIn,
+                    child: ScaleTransition(
+                      scale: _registeredIn,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.25),
+                          ),
+                        ),
+                        child: const Text(
+                          'POKÉDEX UPDATED!',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 1.4,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Text(
+                    'CARD #${e.slot} COLLECTED!',
+                    style: const TextStyle(
+                      fontSize: 26,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1.2,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    e.cardName,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -1831,7 +1999,17 @@ class SetDetailScreen extends StatelessWidget {
 
 class PokemonCardDetailsScreen extends StatefulWidget {
   final PokemonCardResult card;
-  const PokemonCardDetailsScreen({super.key, required this.card});
+
+  // ✅ Optional: if present, we came from a Pokédex slot-locked scan
+  final String? expectedSetId;
+  final int? expectedSlot;
+
+  const PokemonCardDetailsScreen({
+    super.key,
+    required this.card,
+    this.expectedSetId,
+    this.expectedSlot,
+  });
 
   @override
   State<PokemonCardDetailsScreen> createState() =>
@@ -1960,10 +2138,28 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
               SizedBox(
                 height: 48,
                 child: ElevatedButton.icon(
+                  icon: Icon(saved ? Icons.check : Icons.add),
+                  label: Text(saved ? 'Saved' : 'Save to My Collection'),
                   onPressed: saved
                       ? null
                       : () {
                           collectionStore.addCard(card);
+                          final expectedSetId = widget.expectedSetId;
+                          final expectedSlot = widget.expectedSlot;
+
+                          if (expectedSetId != null && expectedSlot != null) {
+                            collectionStore.emitCollected(
+                              CollectedEvent(
+                                setKey: expectedSetId,
+                                slot: expectedSlot,
+                                cardName: card.name,
+                                imageUrl: card.imageLarge.isNotEmpty
+                                    ? card.imageLarge
+                                    : card.imageSmall,
+                              ),
+                            );
+                          }
+
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
                               content: Text(
@@ -1971,10 +2167,20 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
                               ),
                             ),
                           );
+
                           setState(() {});
+
+                          final fromPokedex =
+                              widget.expectedSetId != null &&
+                              widget.expectedSlot != null;
+
+                          if (fromPokedex) {
+                            Navigator.popUntil(
+                              context,
+                              (route) => route.settings.name == 'set_pokedex',
+                            );
+                          }
                         },
-                  icon: Icon(saved ? Icons.check : Icons.add),
-                  label: Text(saved ? 'Saved' : 'Save to My Collection'),
                 ),
               ),
 
@@ -1989,13 +2195,18 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,
-                  children: card.finishes.keys.map((k) {
-                    return ChoiceChip(
-                      label: Text(k),
-                      selected: k == finish,
-                      onSelected: (_) => setState(() => _selectedFinish = k),
-                    );
-                  }).toList(),
+                  children: card.finishes.keys
+                      .map((k) {
+                        return ChoiceChip(
+                          onSelected: saved
+                              ? null
+                              : (_) => setState(() => _selectedFinish = k),
+                          label: Text(k),
+                          selected: k == finish,
+                        );
+                      })
+                      .toList()
+                      .cast<Widget>(),
                 ),
                 const SizedBox(height: 16),
               ],
@@ -2179,7 +2390,17 @@ class ConditionGuideScreen extends StatelessWidget {
 
 class RecognizingScreen extends StatefulWidget {
   final String photoPath;
-  const RecognizingScreen({super.key, required this.photoPath});
+
+  // ✅ add these
+  final String? expectedSetId;
+  final int? expectedSlot;
+
+  const RecognizingScreen({
+    super.key,
+    required this.photoPath,
+    this.expectedSetId,
+    this.expectedSlot,
+  });
 
   @override
   State<RecognizingScreen> createState() => _RecognizingScreenState();
@@ -2188,6 +2409,17 @@ class RecognizingScreen extends StatefulWidget {
 class _RecognizingScreenState extends State<RecognizingScreen> {
   bool _loading = true;
   String? _error;
+
+  bool _matchesExpected(PokemonCardResult card) {
+    final expectedSetId = widget.expectedSetId;
+    final expectedSlot = widget.expectedSlot;
+    if (expectedSetId == null || expectedSlot == null) return true; // free scan
+
+    final cardSet = card.setId.trim();
+    final cardNum = int.tryParse(card.number.replaceAll(RegExp(r'[^0-9]'), ''));
+
+    return cardSet == expectedSetId && cardNum == expectedSlot;
+  }
 
   final _nameCtrl = TextEditingController();
   final _numCtrl = TextEditingController();
@@ -2245,6 +2477,33 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
     );
   }
 
+  Future<void> _showWrongCardDialog(PokemonCardResult found) async {
+    final expectedSetId = widget.expectedSetId;
+    final expectedSlot = widget.expectedSlot;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Wrong card scanned'),
+        content: Text(
+          'You started a slot-locked scan.\n\n'
+          'Expected: #$expectedSlot ($expectedSetId)\n'
+          'Found: #${found.number} (${found.setId})\n'
+          '${found.name}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Try again'),
+          ),
+        ],
+      ),
+    );
+
+    // Kick the user back to the camera after they dismiss the dialog
+    if (mounted) Navigator.pop(context);
+  }
+
   Future<void> _runAll() async {
     setState(() {
       _loading = true;
@@ -2283,6 +2542,11 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
       // ---- PROMO FIX: try to extract SVP slot from raw OCR text ----
       // OCR often shows like "G SYPO27" (meant SVP027)
       final svpSlotDigits = PokemonOcr.extractSvpNumberFromRaw(rawText);
+      // ✅ If this looks like an SVP promo and we're NOT already slot-locked,
+      // auto slot-lock it to svp/# so home scans jump straight to the right card.
+      final inferredExpectedSetId =
+          widget.expectedSetId ?? (svpSlotDigits != null ? 'svp' : null);
+      final inferredExpectedSlot = widget.expectedSlot ?? svpSlotDigits;
 
       // If number is missing, use SVP-prefixed number (best for promos)
       if ((numOnly == null || numOnly.trim().isEmpty) &&
@@ -2318,22 +2582,42 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         number: numOnly,
         setTotal: setTotalStr,
         hp: hp,
+        expectedSetId: inferredExpectedSetId,
+        expectedSlot: inferredExpectedSlot,
+        svpSlot: svpSlotDigits,
       );
 
       if (!mounted) return;
 
       // If confident best, go straight to details.
       if (pick.best != null) {
+        // ✅ Slot-locked enforcement: only allow exact match when expectedSetId/expectedSlot is set
+        if (!_matchesExpected(pick.best!)) {
+          await _showWrongCardDialog(pick.best!);
+          return;
+        }
+
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
-            builder: (_) => PokemonCardDetailsScreen(card: pick.best!),
+            builder: (_) => PokemonCardDetailsScreen(
+              card: pick.best!,
+              expectedSetId: widget.expectedSetId,
+              expectedSlot: widget.expectedSlot,
+            ),
           ),
         );
         return;
       }
 
-      // Otherwise go to results list
+      // If slot-locked and we couldn't confidently match, don't show a broad results list.
+      if (widget.expectedSetId != null && widget.expectedSlot != null) {
+        setState(() {
+          _error =
+              'Could not confirm this is the correct card for slot #${widget.expectedSlot}. Try again.';
+        });
+        return;
+      }
       _goToResults(
         name: usedName,
         number: numOnly,

@@ -70,6 +70,20 @@ class SetSummary {
   }
 }
 
+class CollectedEvent {
+  final String setKey;
+  final int slot;
+  final String cardName;
+  final String imageUrl;
+
+  CollectedEvent({
+    required this.setKey,
+    required this.slot,
+    required this.cardName,
+    required this.imageUrl,
+  });
+}
+
 class CollectionStore extends ChangeNotifier {
   final List<CollectionEntry> _entries = [];
 
@@ -235,6 +249,12 @@ class CollectionStore extends ChangeNotifier {
     });
 
     return summaries;
+  }
+
+  final ValueNotifier<CollectedEvent?> lastCollected = ValueNotifier(null);
+
+  void emitCollected(CollectedEvent e) {
+    lastCollected.value = e;
   }
 
   Map<int, PokemonCardResult> getOwnedSlotMapForSet(String setKey) {
