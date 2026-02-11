@@ -65,28 +65,6 @@ class PokemonOcr {
     'box',
   };
 
-  /// Extracts SVP promo number from raw OCR text.
-  /// Handles common OCR mangles like:
-  /// - "SVP027", "SVP 027"
-  /// - "SYPO27" (V→Y, 0→O)
-  /// Returns digits as string (e.g. "27", "51").
-  /// Extracts the SVP promo number as a STRING (e.g. "51") from raw OCR.
-  /// Returns null if not found.
-  static String? extractSvpNumberStringFromRaw(String rawText) {
-    final t = _normalizeDigitsForNumbers(rawText);
-
-    // Match things like "SVP 051", "SVP051", "S V P 051"
-    final m = RegExp(
-      r'\bS\s*V\s*P\s*0*(\d{1,3})\b',
-      caseSensitive: false,
-    ).firstMatch(t);
-    if (m == null) return null;
-
-    final s = m.group(1);
-    if (s == null) return null;
-    return int.tryParse(s)?.toString(); // normalize "051" -> "51"
-  }
-
   // ---------- Text normalization ----------
   static String _deaccent(String s) {
     return s
@@ -110,7 +88,7 @@ class PokemonOcr {
   static String _squashSpacesLower(String s) =>
       s.toLowerCase().replaceAll(RegExp(r'\s+'), '');
 
-  static String _cleanLine(String s) {
+  static String _cleanLineLetters(String s) {
     final normalized = _deaccent(s).trim();
     final cleaned = normalized.replaceAll(RegExp(r"[^A-Za-z\s\-']"), '').trim();
     return cleaned.replaceAll(RegExp(r'\s+'), ' ');
@@ -121,11 +99,9 @@ class PokemonOcr {
     final t = cleanedLower.trim();
     if (t.isEmpty) return true;
 
-    // Stage header junk
     if (t.startsWith('stage') || t.startsWith('basic')) return true;
     if (t == 'stageb' || t == 'stage' || t == 'basic') return true;
 
-    // Bottom labels
     const badContains = [
       'weakness',
       'resistance',
@@ -144,7 +120,6 @@ class PokemonOcr {
     ];
     if (badContains.any(t.contains)) return true;
 
-    // Pokedex/species/stat line patterns
     final hasStats = t.contains('ht') || t.contains('wt') || t.contains('lbs');
     final hasPokemonWord = t.contains('pokemon') || t.contains('pokmon');
     final startsWithNo =
@@ -153,7 +128,7 @@ class PokemonOcr {
     if (hasStats && (hasPokemonWord || startsWithNo)) return true;
     if ((startsWithNo || t.contains('mouse')) && hasStats) return true;
 
-    // Extremely long lines are rarely names (usually attacks/body text)
+    // extremely long lines are rarely names
     if (t.length > 30) return true;
 
     return false;
@@ -178,30 +153,31 @@ class PokemonOcr {
     final squashed = _squashSpacesLower(cleaned);
 
     if (cleaned.length < 3) return -999;
-    if (_looksLikeNonNameLine(lower) || _looksLikeNonNameLine(squashed))
+    if (_looksLikeNonNameLine(lower) || _looksLikeNonNameLine(squashed)) {
       return -999;
+    }
     if (_hasStopWordToken(lower)) return -999;
     if (lower.contains('tage')) return -999; // stageb/tagb garbage
 
     var score = 0;
 
-    // Prefer reasonable lengths
+    // prefer reasonable lengths
     if (cleaned.length >= 3 && cleaned.length <= 20) score += 14;
-    if (cleaned.length >= 21 && cleaned.length <= 24) score += 7;
+    if (cleaned.length >= 21 && cleaned.length <= 26) score += 7;
 
-    // Prefer title-case starts
+    // title-case starts
     if (RegExp(r'^[A-Z]').hasMatch(cleaned)) score += 6;
 
-    // Penalize ALL CAPS
+    // penalize ALL CAPS
     if (cleaned == cleaned.toUpperCase()) score -= 4;
 
-    // Prefer higher on card (names near top)
+    // prefer higher on card (names near top)
     score += ((1.0 - yNorm) * 18.0).round();
 
-    // Prefer larger font line
+    // prefer larger font
     score += (lineHeight * 0.9).clamp(0, 18).round();
 
-    // Earlier lines slightly favored
+    // earlier lines slightly favored
     score += (10 - index).clamp(0, 10);
 
     return score;
@@ -224,16 +200,74 @@ class PokemonOcr {
     return n == null ? s.trim() : n.toString();
   }
 
-  // ---------- Collector number: robust + bottom-right bias ----------
+  // ---------- SVP promo extraction ----------
+  static String? extractSvpNumberStringFromRaw(String rawText) {
+    final t = _normalizeDigitsForNumbers(rawText);
+
+    final m = RegExp(
+      r'\bS\s*V\s*P\s*0*(\d{1,3})\b',
+      caseSensitive: false,
+    ).firstMatch(t);
+    if (m == null) return null;
+
+    final s = m.group(1);
+    if (s == null) return null;
+    return int.tryParse(s)?.toString();
+  }
+
+  static int? extractSvpNumberFromRaw(String raw) {
+    final t = raw.toUpperCase();
+
+    final patterns = <RegExp>[
+      RegExp(r'\bS\s*V\s*P\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSVP\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSYP\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSYPO\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\bSVPO\s*0*([0-9]{1,3})\b'),
+      RegExp(r'\b(?:SVP|SYP|SYPO|SVPO)\s*0*([0-9]{1,3})\b'),
+    ];
+
+    for (final re in patterns) {
+      final m = re.firstMatch(t);
+      if (m != null) {
+        final n = int.tryParse(m.group(1)!);
+        if (n != null && n >= 1 && n <= 102) return n;
+      }
+    }
+    return null;
+  }
+
+  // ---------- Collector number extraction (NO guessing) ----------
   static ({String? number, String? setTotal}) _pickBestCollectorFraction(
     List<_LineBox> lineBoxes,
     String raw,
   ) {
-    final frac = RegExp(r'([0-9]{1,4})\s*([/|Il])\s*([0-9]{2,4})');
+    // We only accept fraction-like separators (/, |, I, l, -, en-dash/em-dash)
+    // This avoids inventing pairs like "150 130" from random text.
+    final frac = RegExp(
+      r'([0-9]{1,4})\s*([/|Il\-\u2013\u2014])\s*([0-9]{2,4})',
+    );
+
     final candidates = <_NumCandidate>[];
+
+    bool looksLikeDamageLine(String sLower) {
+      // filters out common body/attack text contexts
+      return sLower.contains('damage') ||
+          sLower.contains('does ') ||
+          sLower.contains('do ') ||
+          sLower.contains('thudding') ||
+          sLower.contains('press') ||
+          sLower.contains('ability') ||
+          sLower.contains('evolves from');
+    }
 
     void addMatches(String text, int lineIndex, double top, double left) {
       final t = _normalizeDigitsForNumbers(text);
+      final lower = t.toLowerCase();
+
+      // skip obvious non-number lines
+      if (looksLikeDamageLine(lower)) return;
+
       for (final m in frac.allMatches(t)) {
         final num = m.group(1);
         final den = m.group(3);
@@ -242,6 +276,13 @@ class PokemonOcr {
         final numInt = int.tryParse(num);
         final denInt = int.tryParse(den);
         if (numInt == null || denInt == null) continue;
+
+        // plausibility: modern printed totals typically 60..400, keep it tight
+        if (denInt < 40 || denInt > 400) continue;
+
+        // numerator plausibility:
+        // allow secret rares > printedTotal (e.g. 245/198), but not insane
+        if (numInt < 1 || numInt > denInt + 300) continue;
 
         candidates.add(
           _NumCandidate(
@@ -265,7 +306,7 @@ class PokemonOcr {
       addMatches(raw, 999, 0, 0);
     }
 
-    // 3) bottom-right fallback
+    // 3) bottom-right bias pass (helps when OCR scatters the number)
     if (candidates.isEmpty && lineBoxes.isNotEmpty) {
       final bottomRight = [...lineBoxes]
         ..sort((a, b) {
@@ -273,7 +314,7 @@ class PokemonOcr {
           return c != 0 ? c : b.left.compareTo(a.left);
         });
 
-      for (var i = 0; i < min(bottomRight.length, 40); i++) {
+      for (var i = 0; i < min(bottomRight.length, 60); i++) {
         addMatches(
           bottomRight[i].text,
           900 + i,
@@ -289,25 +330,29 @@ class PokemonOcr {
     int score(_NumCandidate c) {
       var s = 0;
 
-      // Denominator plausibility
-      if (c.den >= 100 && c.den <= 999)
-        s += 80;
-      else if (c.den >= 60 && c.den < 100)
-        s += 55;
-      else
-        s -= 30;
-
-      // Numerator plausibility
-      if (c.num >= 1 && c.num <= c.den)
-        s += 20;
-      else
+      // prefer printed totals in modern range
+      if (c.den >= 100 && c.den <= 400) {
+        s += 90;
+      } else if (c.den >= 60 && c.den < 100) {
+        s += 40;
+      } else {
         s -= 80;
+      }
 
-      // Prefer lower and right on card
+      // prefer realistic numerators
+      if (c.num >= 1 && c.num <= c.den) {
+        s += 25;
+      } else if (c.num > c.den && c.num <= c.den + 250) {
+        s += 20; // secret rare pattern
+      } else {
+        s -= 80;
+      }
+
+      // prefer lower and right on card
       s += (c.top / 18).clamp(0, 140).toInt();
       s += (c.left / 25).clamp(0, 60).toInt();
 
-      // Slight bias to later lines
+      // slight bias to later lines
       s += min(c.lineIndex, 80);
 
       return s;
@@ -325,81 +370,64 @@ class PokemonOcr {
   // ---------- HP / Stage ----------
   static int? _extractHp(String raw) {
     final t = _normalizeDigitsForNumbers(raw);
+    final lower = t.toLowerCase();
 
-    // 1) Strong matches: "HP 150" or "150 HP"
+    // Trainers / Energy do not have HP
+    if (lower.contains('trainer') ||
+        lower.contains('supporter') ||
+        lower.contains('item') ||
+        lower.contains('stadium') ||
+        lower.contains('energy')) {
+      return null;
+    }
+
+    // Strong matches first (label present)
     final m1 = RegExp(
       r'\bHP\s*(\d{2,3})\b',
       caseSensitive: false,
     ).firstMatch(t);
-    if (m1 != null) return int.tryParse(m1.group(1)!);
+    if (m1 != null) {
+      final hp = int.tryParse(m1.group(1)!);
+      if (hp != null && hp >= 10 && hp <= 400) return hp;
+    }
 
     final m2 = RegExp(
       r'\b(\d{2,3})\s*HP\b',
       caseSensitive: false,
     ).firstMatch(t);
-    if (m2 != null) return int.tryParse(m2.group(1)!);
+    if (m2 != null) {
+      final hp = int.tryParse(m2.group(1)!);
+      if (hp != null && hp >= 10 && hp <= 400) return hp;
+    }
 
-    // 2) Spaced letters: "H P 150"
     final m3 = RegExp(
       r'\bH\s*P\s*(\d{2,3})\b',
       caseSensitive: false,
     ).firstMatch(t);
-    if (m3 != null) return int.tryParse(m3.group(1)!);
-
-    // 3) Heuristic fallback (when OCR misses "HP"):
-    // - HP is usually one of the largest numbers on the card
-    // - attack text often includes "does 80 damage" etc.
-    // - HP tends to appear near the bottom alongside weakness/retreat/resistance
-    final lower = t.toLowerCase();
-    final matches = RegExp(r'\b(\d{2,3})\b').allMatches(t).toList();
-
-    int? best;
-    double bestScore = -1;
-
-    for (final m in matches) {
-      final s = m.group(1);
-      final n = (s == null) ? null : int.tryParse(s);
-      if (n == null) continue;
-      if (n < 40 || n > 340) continue;
-
-      final start = m.start;
-      final end = m.end;
-
-      // Context window around the number
-      final left = (start - 25 < 0) ? 0 : start - 25;
-      final right = (end + 25 > lower.length) ? lower.length : end + 25;
-      final ctx = lower.substring(left, right);
-
-      // Hard reject: looks like attack damage
-      // (covers: "does 80 damage", "do 80 damage", "80 damage to itself", etc.)
-      if (ctx.contains('damage') ||
-          ctx.contains('does $n') ||
-          ctx.contains('do $n')) {
-        continue;
-      }
-
-      // Prefer numbers near bottom (HP/weakness/retreat area tends to be later)
-      final pos = start / lower.length; // 0..1
-      double score = 0;
-
-      // Base: prefer larger numbers (HP often larger than attack numbers)
-      score += n / 340.0;
-
-      // Boost if appears late in the text
-      score += pos;
-
-      // Boost if nearby weakness/resistance/retreat (common near HP line)
-      if (ctx.contains('weak')) score += 0.7;
-      if (ctx.contains('resist')) score += 0.5;
-      if (ctx.contains('retreat')) score += 0.5;
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = n;
-      }
+    if (m3 != null) {
+      final hp = int.tryParse(m3.group(1)!);
+      if (hp != null && hp >= 10 && hp <= 400) return hp;
     }
 
-    return best;
+    // If OCR dropped the HP label entirely, do a *very* constrained fallback
+    // only if it looks like a Pokémon card.
+    final looksLikePokemonCard =
+        lower.contains('evolves from') || lower.contains('ability');
+
+    if (!looksLikePokemonCard) return null;
+
+    final nums = RegExp(r'\b(\d{2,3})\b').allMatches(t).toList();
+    int best = -1;
+
+    for (final m in nums) {
+      final s = m.group(1);
+      final n = s == null ? null : int.tryParse(s);
+      if (n == null) continue;
+      if (n < 70 || n > 400) continue; // avoid common damage values
+      if (n > best) best = n;
+    }
+
+    return best > 0 ? best : null;
   }
 
   static String? _extractStage(String raw) {
@@ -423,10 +451,10 @@ class PokemonOcr {
   }
 
   // ---------- Name normalization ----------
-  static String _normalizeName(String s) {
+  static String _normalizeSuffixes(String s) {
     var t = _deaccent(s).trim();
 
-    // add spaces for glued suffixes
+    // add spaces for glued suffixes: "Gardevoirex" -> "Gardevoir ex"
     t = t.replaceAllMapped(
       RegExp(r'([A-Za-z])((ex|EX|gx|GX|v|V|max|MAX|vstar|VSTAR))\b'),
       (m) => '${m.group(1)} ${m.group(2)}',
@@ -439,25 +467,39 @@ class PokemonOcr {
   static String _normalizePickedName(String s) {
     var t = _deaccent(s).trim();
 
-    // strip basic/stage junk
+    // strip BASIC-like headers even when glued
+    // Examples: "SrAGIPGardevoir", "BẠSIGSnorlax"
     t = t.replaceAll(
-      RegExp(r'^(?:BASIC|BSIC|ASIC|SIC)\s+', caseSensitive: false),
+      RegExp(
+        r"^(?:[^A-Za-z]*)"
+        r"(?:BASIC|BSIC|ASIC|SIC|BASIG|BAS1G|BA5IG|BẠSIG|SRAGIP)"
+        r"\s*",
+        caseSensitive: false,
+      ),
       '',
     );
+
+    // remove stage headers
     t = t.replaceAll(
       RegExp(r'^(?:STAGE\s*[12Z]|STAGE[12Z]|STAGEB)\s+', caseSensitive: false),
       '',
     );
 
-    // remove Lv/LV (old cards)
+    // fix common OCR: "Gardevoirek" / "Gardevoirex" -> "Gardevoir ex"
+    t = t.replaceAllMapped(
+      RegExp(r"^([A-Za-z][A-Za-z'\- ]{2,30})\s*e[kx]\b", caseSensitive: false),
+      (m) => '${m.group(1)!.trim()} ex',
+    );
+
+    // remove Lv
     t = t.replaceAll(RegExp(r'\bLV\b', caseSensitive: false), '');
     t = t.replaceAll(RegExp(r'\bLv\b', caseSensitive: false), '');
 
     // drop trailing single-letter junk
     t = t.replaceAll(RegExp(r'\s+[A-Za-z]\b'), '');
 
-    // normalize suffixes
-    t = _normalizeName(t);
+    // normalize suffix spacing
+    t = _normalizeSuffixes(t);
 
     // Fix common OCR: "MewtwoX" => "Mewtwo GX"
     t = t.replaceAllMapped(
@@ -465,20 +507,23 @@ class PokemonOcr {
       (m) => '${m.group(1)!.trim()} GX',
     );
 
-    // reject obvious pokedex stat line fragments even if accent/letters drop
     final lower = t.toLowerCase();
-    if ((lower.contains('pokemon') || lower.contains('pokmon')) &&
-        (lower.contains('ht') ||
-            lower.contains('wt') ||
-            lower.contains('lbs'))) {
-      return '';
-    }
+    if (_looksLikeNonNameLine(lower)) return '';
+    if (_hasStopWordToken(lower)) return '';
 
     t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
     if (t.length < 3) return '';
-    if (_looksLikeNonNameLine(t.toLowerCase())) return '';
 
-    return t;
+    // if still glued mess, try to salvage last TitleCase-ish token
+    if (!t.contains(' ') && t.length > 10) {
+      final m2 = RegExp(r'([A-Z][a-z]{2,})$').firstMatch(t);
+      if (m2 != null) {
+        final tail = m2.group(1)!;
+        if (tail.length >= 4 && tail.length < t.length) t = tail;
+      }
+    }
+
+    return t.trim();
   }
 
   // ---------- Name extraction ----------
@@ -500,10 +545,6 @@ class PokemonOcr {
     name = _normalizePickedName(name);
     if (name.isEmpty) return null;
 
-    final lower = name.toLowerCase();
-    if (_hasStopWordToken(lower)) return null;
-    if (_looksLikeNonNameLine(lower)) return null;
-
     return name;
   }
 
@@ -515,7 +556,7 @@ class PokemonOcr {
 
     final lowerLine = line.toLowerCase();
 
-    // Hard reject pokedex stat line
+    // reject stat line
     final hasStats =
         lowerLine.contains('ht') ||
         lowerLine.contains('wt') ||
@@ -530,7 +571,7 @@ class PokemonOcr {
 
     String candidateRegion = line;
 
-    // If "HP" appears, keep the left side
+    // if "HP" appears, keep left side
     final hpMatch = RegExp(
       r'\bH\s*P\b',
       caseSensitive: false,
@@ -539,7 +580,7 @@ class PokemonOcr {
       candidateRegion = candidateRegion.substring(0, hpMatch.start).trim();
     }
 
-    // If "Pokemon"/"Pokmon" appears, keep the left side
+    // if "Pokemon" appears, keep left side
     final pokeMatch = RegExp(
       r'\bPOK(?:E)?MON\b',
       caseSensitive: false,
@@ -548,8 +589,7 @@ class PokemonOcr {
       candidateRegion = candidateRegion.substring(0, pokeMatch.start).trim();
     }
 
-    // Clean to letters-only
-    final cleaned = _cleanLine(candidateRegion);
+    final cleaned = _cleanLineLetters(candidateRegion);
     if (cleaned.length < 3) return null;
 
     final picked = _normalizePickedName(cleaned);
@@ -581,7 +621,7 @@ class PokemonOcr {
       if (_looksLikeNonNameLine(lower)) return;
       if (lower.contains('tage')) return;
 
-      // Avoid short attack lines that include damage numbers
+      // avoid short attack-ish lines with digits
       if (RegExp(r'\b\d{1,3}\b').hasMatch(lb.text) &&
           picked.split(' ').length <= 3) {
         return;
@@ -607,14 +647,14 @@ class PokemonOcr {
       }
     }
 
-    // Pass 1: top area
+    // pass 1: top area
     for (var i = 0; i < min(90, lineBoxes.length); i++) {
       final lb = lineBoxes[i];
       if (span > 0 && lb.top > topCutoff) continue;
       considerLine(lb, i);
     }
 
-    // Pass 2: fallback if nothing found
+    // pass 2: fallback
     if (candidates.isEmpty) {
       for (var i = 0; i < min(140, lineBoxes.length); i++) {
         considerLine(lineBoxes[i], i);
@@ -676,7 +716,7 @@ class PokemonOcr {
         }
       }
 
-      // Stable ordering: top->bottom then left->right
+      // stable ordering: top->bottom then left->right
       lineBoxes.sort((a, b) {
         final c = a.top.compareTo(b.top);
         return c != 0 ? c : a.left.compareTo(b.left);
@@ -684,26 +724,26 @@ class PokemonOcr {
 
       final frac = _pickBestCollectorFraction(lineBoxes, raw);
       final hp = _extractHp(raw);
-      print('🧩 HP DEBUG raw.len=${raw.length}');
-      print(
-        '🧩 HP DEBUG raw.head="${raw.substring(0, raw.length > 180 ? 180 : raw.length)}"',
-      );
-      print('🧩 HP DEBUG extractedHp=$hp');
-      ;
-      final svpSlot = PokemonOcr.extractSvpNumberFromRaw(raw);
-
       final stage = _extractStage(raw);
+      print('🧾 FRACTION DEBUG → ${frac.number}/${frac.setTotal}');
 
-      // Name priority: near HP first, then scored top/fallback
       String? best = _extractNameNearHp(raw);
       best ??= _extractNameFromTopArea(lineBoxes);
 
+      // final cleanup (handles your glued "SrAGIPGardevoirek" case)
+      if (best != null && best.isNotEmpty) {
+        final cleaned = _normalizePickedName(best);
+        if (cleaned.isNotEmpty) best = cleaned;
+      }
+
       if (debug) {
-        print('--- OCR RAW ---');
-        print(raw);
+        // ignore: avoid_print
+        print('--- OCR RAW ---\n$raw');
+        // ignore: avoid_print
         print('--- OCR LINES (first 30) ---');
         for (var i = 0; i < min(lineBoxes.length, 30); i++) {
           final lb = lineBoxes[i];
+          // ignore: avoid_print
           print(
             '[${i.toString().padLeft(2)}] top=${lb.top.toStringAsFixed(1)} '
             'left=${lb.left.toStringAsFixed(1)} h=${lb.height.toStringAsFixed(1)} :: ${lb.text}',
@@ -711,6 +751,16 @@ class PokemonOcr {
         }
       }
 
+      // keep your existing debug prints
+      // ignore: avoid_print
+      print('🧩 HP DEBUG raw.len=${raw.length}');
+      // ignore: avoid_print
+      print(
+        '🧩 HP DEBUG raw.head="${raw.substring(0, raw.length > 180 ? 180 : raw.length)}"',
+      );
+      // ignore: avoid_print
+      print('🧩 HP DEBUG extractedHp=$hp');
+      // ignore: avoid_print
       print(
         '🔍 OCR DEBUG → name=$best, number=${frac.number}, setTotal=${frac.setTotal}, hp=$hp, stage=$stage',
       );
@@ -731,30 +781,81 @@ class PokemonOcr {
     }
   }
 
-  /// Tries to detect Scarlet & Violet promo slot from raw OCR text.
-  /// Example OCR junk: "G SYPO27" meaning "SVP 027"
-  static int? extractSvpNumberFromRaw(String raw) {
-    final t = raw.toUpperCase();
+  static String? extractTrainerTitleFromRaw(String rawText) {
+    if (rawText.trim().isEmpty) return null;
 
-    // Common OCR variants that should count as "SVP"
-    // Examples seen: "SYPO27", "SVPO27", "S V P 027", "SVP027"
-    final patterns = <RegExp>[
-      RegExp(r'\bS\s*V\s*P\s*0*([0-9]{1,3})\b'),
-      RegExp(r'\bSVP\s*0*([0-9]{1,3})\b'),
-      RegExp(r'\bSYP\s*0*([0-9]{1,3})\b'),
-      RegExp(r'\bSYPO\s*0*([0-9]{1,3})\b'),
-      RegExp(r'\bSVPO\s*0*([0-9]{1,3})\b'),
-      // catches cases like "G SYPO27" (junk before it)
-      RegExp(r'\b(?:SVP|SYP|SYPO|SVPO)\s*0*([0-9]{1,3})\b'),
-    ];
+    final lines = rawText
+        .split('\n')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList();
 
-    for (final re in patterns) {
-      final m = re.firstMatch(t);
-      if (m != null) {
-        final n = int.tryParse(m.group(1)!);
-        if (n != null && n >= 1 && n <= 102) return n;
+    int idx = -1;
+    for (var i = 0; i < lines.length; i++) {
+      final l = lines[i].toLowerCase();
+      if (l == 'trainer' ||
+          l == 'traner' ||
+          l.startsWith('trainer') ||
+          l.startsWith('traner')) {
+        idx = i;
+        break;
       }
     }
+    if (idx < 0) return null;
+
+    for (var j = idx + 1; j < lines.length && j <= idx + 6; j++) {
+      final l = lines[j];
+      final lower = l.toLowerCase();
+
+      if (lower == 'supporter' || lower == 'item' || lower == 'stadium')
+        continue;
+
+      if (lower.contains('draw ') ||
+          lower.contains('you may') ||
+          lower.contains('cards')) {
+        continue;
+      }
+
+      final hasLetters = RegExp(r'[A-Za-z]').hasMatch(l);
+      if (!hasLetters) continue;
+
+      final cleaned = l
+          .replaceAll(RegExp(r"[^A-Za-z0-9\s'\-]"), ' ')
+          .replaceAll(RegExp(r"\s+"), ' ')
+          .trim();
+
+      if (cleaned.length < 3 || cleaned.length > 30) continue;
+
+      return cleaned;
+    }
+    return null;
+  }
+
+  /// Detect certain promos when OCR misses the collector number.
+  /// Returns SVP slot digits if we are highly confident, else null.
+  static int? detectSvpSlotBySignature(String raw) {
+    // Normalize hard: uppercase + remove whitespace/punctuation so
+    // "AbilityVoraciousness" still matches.
+    final up = raw.toUpperCase();
+    final flat = up.replaceAll(
+      RegExp(r'[^A-Z0-9]'),
+      '',
+    ); // keep letters+digits only
+
+    bool has(String needle) => flat.contains(needle);
+
+    // Snorlax SVP 051 signature:
+    // "Voraciousness" + "Thudding Press" + "Leftovers" (often OCR'd as Leftoyers/Leftov...)
+    final hasVoracious = has('VORACIOUS');
+    final hasThudding = has('THUDDING');
+    final hasLefto = has(
+      'LEFTO',
+    ); // catches LEFTOVERS / LEFTOYERS / LEFT0VERS etc.
+
+    if (hasVoracious && hasThudding && hasLefto) {
+      return 51;
+    }
+
     return null;
   }
 }

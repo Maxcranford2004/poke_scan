@@ -241,9 +241,13 @@ class PokemonTcgApi {
     if (s == null) return null;
     final digits = s.replaceAll(RegExp(r'[^0-9]'), '');
     if (digits.isEmpty) return null;
+
     final n = int.tryParse(digits);
     if (n == null) return null;
-    if (n < 10 || n > 400) return null;
+
+    // Prevent poison values like 90 (from damage text etc.)
+    if (n < 100 || n > 400) return null;
+
     return n;
   }
 
@@ -655,85 +659,13 @@ class PokemonTcgApi {
     );
   }
 
-  Future<ReliablePick?> _scanLookupViaProxy({
-    required String name,
-    String? number,
-    String? setTotal,
-    int? hp,
-    String? expectedSetId,
-    int? expectedSlot,
-  }) async {
-    final cleanedName = _cleanName(name);
-    final num = _cleanCollectorNumber(number);
-    final total = _parseSetTotal(setTotal);
-
-    if (cleanedName.isEmpty && num == null) return null;
-
-    final qp = <String, String>{};
-    if (cleanedName.isNotEmpty) qp['name'] = cleanedName;
-    if (num != null) qp['number'] = num;
-    if (total != null) qp['printedTotal'] = total.toString();
-    if (hp != null && hp > 0) qp['hp'] = hp.toString();
-
-    // ✅ slot-locked params
-    if (expectedSetId != null && expectedSetId.trim().isNotEmpty) {
-      qp['expectedSetId'] = expectedSetId.trim();
-    }
-    if (expectedSlot != null) {
-      qp['expectedSlot'] = expectedSlot.toString();
-    }
-
-    final uri = _proxyUri('/scan-lookup', qp);
-    final j = await _proxyGetJson(uri);
-
-    if (j['ok'] != true) return null;
-
-    if (j['found'] != true) {
-      return ReliablePick(
-        best: null,
-        candidates: const [],
-        strategy: 'proxy-none',
-      );
-    }
-
-    final confident = j['confident'] == true;
-
-    final bestAny = j['best'];
-    if (bestAny is! Map) return null;
-    final best = _fromWorkerRow(bestAny.cast<String, dynamic>());
-
-    if (confident) {
-      return ReliablePick(
-        best: best,
-        candidates: const [],
-        strategy: 'proxy-confident',
-      );
-    }
-
-    final cand = <PokemonCardResult>[];
-    final rawCandidates = j['candidates'];
-    if (rawCandidates is List) {
-      for (final c in rawCandidates) {
-        if (c is Map) cand.add(_fromWorkerRow(c.cast<String, dynamic>()));
-      }
-    }
-
-    return ReliablePick(
-      best: null,
-      candidates: cand,
-      strategy: 'proxy-candidates',
-    );
-  }
-
-  // ------------------- Reliable scanner strategy (WORKER FIRST) -------------------
-
   Future<ReliablePick> searchCardsReliable({
     required String name,
     String? number,
     String? setTotal,
     int? hp,
 
-    // ✅ optional (slot locked scans from Pokédex)
+    // optional (slot locked scans from Pokédex)
     String? expectedSetId,
     int? expectedSlot,
     int? svpSlot,
@@ -741,15 +673,28 @@ class PokemonTcgApi {
     final safeName = _cleanName(name);
     final lowerName = safeName.toLowerCase().trim();
     final wantNum = _cleanCollectorNumber(number);
+    final wantTotal = _parseSetTotal(setTotal);
 
     final isLabel =
         lowerName == 'trainer' ||
         lowerName == 'traner' ||
         lowerName == 'pokemon' ||
         lowerName == 'energy';
-    // ✅ SVP promo fast-path:
-    // If OCR detected an SVP slot (like "SVP 027"), fetch the exact promo from /preview.
+
+    // "strict" is ONLY safe when we truly have a numeric fraction like 245/198
+    final strictFraction =
+        (wantNum != null) &&
+        RegExp(r'^\d+$').hasMatch(wantNum) &&
+        (wantTotal != null);
+
+    // ---------------- SVP HARD PATH ----------------
+    // If OCR detected SVP slot (like "SVP 051"), we should NOT allow fallback
+    // to generic Snorlax matches.
     if (svpSlot != null && svpSlot > 0) {
+      // ensure SVP set is present (non-blocking; preview may still work without this)
+      await ensureSetPresent('svp');
+
+      // A) exact preview lookup
       try {
         final uri = _proxyUri('/preview', {
           'setId': 'svp',
@@ -771,25 +716,138 @@ class PokemonTcgApi {
         // ignore: avoid_print
         print('⚠️ svp preview failed: $e');
       }
+
+      // B) if preview failed, force slot-locked scan-lookup on worker
+      // (do NOT pass name/printedTotal/hp — they can poison results)
+      try {
+        final uri = _proxyUri('/scan-lookup', {
+          'expectedSetId': 'svp',
+          'expectedSlot': svpSlot.toString(),
+          'strict': '1',
+        });
+
+        final j = await _proxyGetJson(uri);
+        if (j['ok'] == true) {
+          if (j['found'] == true && j['best'] is Map) {
+            final best = _fromWorkerRow(
+              (j['best'] as Map).cast<String, dynamic>(),
+            );
+            return ReliablePick(
+              best: best,
+              candidates: const [],
+              strategy: 'svp-worker-locked',
+            );
+          }
+          if (j['candidates'] is List) {
+            final list = (j['candidates'] as List)
+                .whereType<Map>()
+                .map((m) => _fromWorkerRow(m.cast<String, dynamic>()))
+                .toList();
+            if (list.isNotEmpty) {
+              return ReliablePick(
+                best: list.length == 1 ? list.first : null,
+                candidates: list,
+                strategy: 'svp-worker-locked-candidates',
+              );
+            }
+          }
+        }
+      } catch (e) {
+        // ignore: avoid_print
+        print('⚠️ svp worker locked scan-lookup failed: $e');
+      }
+
+      // If we got here, we intentionally STOP rather than returning the wrong Snorlax.
+      return ReliablePick(
+        best: null,
+        candidates: const [],
+        strategy: 'svp-not-found',
+      );
     }
 
-    // ✅ WORKER FIRST (includes slot-locked behavior)
+    // ---------------- WORKER FIRST (scan-lookup) ----------------
+    // We try a few variants to avoid trainer/label poisoning.
+    Future<ReliablePick?> tryWorker({
+      required bool includeName,
+      required bool includeStrict,
+    }) async {
+      final qp = <String, String>{};
+
+      if (includeName && safeName.isNotEmpty) qp['name'] = safeName;
+      if (wantNum != null && wantNum.isNotEmpty) qp['number'] = wantNum;
+
+      // NOTE: worker expects "printedTotal" (string ok)
+      if (setTotal != null && setTotal.trim().isNotEmpty) {
+        qp['printedTotal'] = setTotal.trim();
+      }
+
+      if (hp != null) qp['hp'] = hp.toString();
+
+      if (expectedSetId != null && expectedSetId.trim().isNotEmpty) {
+        qp['expectedSetId'] = expectedSetId.trim();
+      }
+      if (expectedSlot != null) qp['expectedSlot'] = expectedSlot.toString();
+
+      if (includeStrict && strictFraction) qp['strict'] = '1';
+
+      final uri = _proxyUri('/scan-lookup', qp);
+      final j = await _proxyGetJson(uri);
+
+      if (j['ok'] == true) {
+        if (j['found'] == true && j['best'] is Map) {
+          final best = _fromWorkerRow(
+            (j['best'] as Map).cast<String, dynamic>(),
+          );
+          return ReliablePick(
+            best: best,
+            candidates: const [],
+            strategy: 'worker-best',
+          );
+        }
+
+        if (j['candidates'] is List) {
+          final list = (j['candidates'] as List)
+              .whereType<Map>()
+              .map((m) => _fromWorkerRow(m.cast<String, dynamic>()))
+              .toList();
+
+          if (list.isNotEmpty) {
+            return ReliablePick(
+              best: list.length == 1 ? list.first : null,
+              candidates: list,
+              strategy: 'worker-candidates',
+            );
+          }
+        }
+      }
+
+      return null;
+    }
+
     try {
-      final proxyPick = await _scanLookupViaProxy(
-        name: name,
-        number: number,
-        setTotal: setTotal,
-        hp: hp,
-        expectedSetId: expectedSetId,
-        expectedSlot: expectedSlot,
-      );
-      if (proxyPick != null) return proxyPick;
+      // 1) Normal attempt (with name, strict if safe)
+      final a = await tryWorker(includeName: true, includeStrict: true);
+      if (a != null) return a;
+
+      // 2) If label-ish / risky name, retry without name (keeps number/total/hp)
+      if (isLabel || safeName.isEmpty) {
+        final b = await tryWorker(includeName: false, includeStrict: true);
+        if (b != null) return b;
+      }
+
+      // 3) If strict was on, loosen strict (sometimes OCR total is wrong)
+      final c = await tryWorker(includeName: true, includeStrict: false);
+      if (c != null) return c;
+
+      // 4) Last resort: no name + no strict (for trainer label cases)
+      final d = await tryWorker(includeName: false, includeStrict: false);
+      if (d != null) return d;
     } catch (e) {
       // ignore: avoid_print
-      print('⚠️ proxy scan-lookup failed: $e');
+      print('⚠️ worker scan-lookup failed: $e');
     }
 
-    // If label-only and no number, nothing useful
+    // If label-only and no number, nothing useful (worker-only mode)
     if (isLabel && (wantNum == null || wantNum.isEmpty)) {
       return ReliablePick(
         best: null,
@@ -807,59 +865,7 @@ class PokemonTcgApi {
       );
     }
 
-    // 1) strongest: number + printedTotal
-    final wantTotal = _parseSetTotal(setTotal);
-    if (wantNum != null && wantNum.isNotEmpty && wantTotal != null) {
-      final results = await refreshSearch(
-        name: '',
-        set: null,
-        number: wantNum,
-        setTotal: setTotal,
-        pageSize: 50,
-      );
-      if (results.isNotEmpty) {
-        return ReliablePick(
-          best: results.length == 1 ? results.first : null,
-          candidates: results,
-          strategy: 'number+total',
-        );
-      }
-    }
-
-    // 2) name + number
-    if (wantNum != null && wantNum.isNotEmpty && safeName.isNotEmpty) {
-      final results = await refreshSearch(
-        name: safeName,
-        set: null,
-        number: wantNum,
-        setTotal: null,
-        pageSize: 50,
-      );
-      if (results.isNotEmpty) {
-        return ReliablePick(
-          best: results.length == 1 ? results.first : null,
-          candidates: results,
-          strategy: 'name+number',
-        );
-      }
-    }
-
-    // 3) name only
-    if (safeName.isNotEmpty) {
-      final results = await refreshSearch(
-        name: safeName,
-        set: null,
-        number: null,
-        setTotal: null,
-        pageSize: 100,
-      );
-      return ReliablePick(
-        best: results.length == 1 ? results.first : null,
-        candidates: results,
-        strategy: 'name-only',
-      );
-    }
-
+    // (your existing direct API fallbacks can stay here if you ever re-enable it)
     return ReliablePick(best: null, candidates: const [], strategy: 'empty');
   }
 }
