@@ -1,28 +1,540 @@
+﻿// lib/main.dart
+import 'dart:async';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart';
-
-import 'package:poke_scan/pokemon_tcg_api.dart';
-import 'package:poke_scan/collection_store.dart';
-import 'package:poke_scan/pokemon_ocr.dart';
-import 'package:image_picker/image_picker.dart';
-import 'pokemon_models.dart';
-import 'package:hive_flutter/hive_flutter.dart';
-import 'card_showcase_screen.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+
+import 'pokemon_tcg_api.dart';
+import 'collection_store.dart';
+import 'pokemon_ocr.dart';
+import 'pokemon_models.dart';
+import 'card_showcase_screen.dart';
+import 'pokemon_card_showcase.dart';
+import 'dart:ui' show lerpDouble;
+import 'dart:ui';
+import 'featured_card.dart';
+import 'firebase_options.dart';
 
 List<CameraDescription> gCameras = const [];
 
+bool _hasPersistentCollectionAccess(User? user) {
+  return user != null && !user.isAnonymous;
+}
+
+String _accountIdentifier(User user) {
+  final email = user.email?.trim();
+  if (email != null && email.isNotEmpty) return email;
+
+  final shortUid = user.uid.length > 8 ? user.uid.substring(0, 8) : user.uid;
+  if (user.isAnonymous) return 'Guest ($shortUid)';
+  return 'User ($shortUid)';
+}
+
+String _accountStatusTitle(User? user) {
+  if (user == null) return 'Signed out';
+  return user.isAnonymous ? 'Guest test mode' : 'Signed in';
+}
+
+String _accountOwnershipExplanation(User? user) {
+  if (user == null) {
+    return 'You can continue as a guest to test scanning and search on this device, but saving cards requires a real account.';
+  }
+  if (user.isAnonymous) {
+    return 'You are in guest test mode. You can scan and search cards, but saving cards and Pokédex ownership require a real account.';
+  }
+  return 'You are signed in. Your collection still works on this device, and signed-in sessions can sync card data to cloud. Older local or demo data may not automatically move between users.';
+}
+
+String? getCurrentUserId() {
+  return FirebaseAuth.instance.currentUser?.uid;
+}
+
+String _accountActionLabel(User? user) {
+  if (user == null) return 'Continue as guest';
+  if (user.isAnonymous) return 'Exit guest mode';
+  return 'Sign out';
+}
+
+IconData _accountActionIcon(User? user) {
+  if (user == null) return Icons.science_outlined;
+  return Icons.logout_rounded;
+}
+
+Widget _buildAccountActionButtons(BuildContext context, User? user) {
+  if (user == null || user.isAnonymous) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        TextButton(
+          onPressed: () => _handleAuthAction(context, user: user),
+          child: Text(_accountActionLabel(user)),
+        ),
+        FilledButton(
+          onPressed: () => _startCreateAccountFlow(context),
+          child: const Text('Create account'),
+        ),
+        OutlinedButton(
+          onPressed: () => _startSignInFlow(context),
+          child: const Text('Sign in'),
+        ),
+      ],
+    );
+  }
+
+  return TextButton(
+    onPressed: () => _handleAuthAction(context, user: user),
+    child: Text(_accountActionLabel(user)),
+  );
+}
+
+Future<void> _handleAuthAction(
+  BuildContext context, {
+  required User? user,
+}) async {
+  try {
+    if (user == null) {
+      final credential = await FirebaseAuth.instance.signInAnonymously();
+      if (!context.mounted) return;
+      final signedInUser = credential.user;
+      final shortUid = signedInUser == null
+          ? null
+          : (signedInUser.uid.length > 8
+                ? signedInUser.uid.substring(0, 8)
+                : signedInUser.uid);
+      final signedInLabel = shortUid == null ? 'guest' : 'guest ($shortUid)';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Continuing as $signedInLabel.')));
+      return;
+    }
+
+    await FirebaseAuth.instance.signOut();
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(user.isAnonymous ? 'Exited guest mode.' : 'Signed out.'),
+      ),
+    );
+  } on FirebaseAuthException catch (e) {
+    if (!context.mounted) return;
+    final message = e.code == 'operation-not-allowed'
+        ? 'Guest mode is not enabled in Firebase Auth yet.'
+        : 'Sign-in failed: ${e.message ?? e.code}';
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  } catch (e) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Authentication failed: $e')));
+  }
+}
+
+Future<void> _showAccountRequiredToSavePrompt(BuildContext context) async {
+  final shouldCreateAccount = await showDialog<bool>(
+    context: context,
+    builder: (context) {
+      return AlertDialog(
+        title: const Text('Save your collection'),
+        content: const Text(
+          'You found your card. Create an account to save it to your collection and track your Pokédex.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep browsing'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Create account'),
+          ),
+        ],
+      );
+    },
+  );
+
+  if (shouldCreateAccount != true || !context.mounted) return;
+
+  await _startCreateAccountFlow(context);
+}
+
+Future<void> _startCreateAccountFlow(BuildContext context) async {
+  final created = await Navigator.of(
+    context,
+  ).push<bool>(MaterialPageRoute(builder: (_) => const CreateAccountScreen()));
+
+  if (created != true || !context.mounted) return;
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(content: Text('Account created. You can now save cards.')),
+  );
+}
+
+Future<void> _startSignInFlow(BuildContext context) async {
+  final signedIn = await Navigator.of(
+    context,
+  ).push<bool>(MaterialPageRoute(builder: (_) => const SignInScreen()));
+
+  if (signedIn != true || !context.mounted) return;
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(content: Text('Signed in. You can now save cards.')),
+  );
+}
+
+class CreateAccountScreen extends StatefulWidget {
+  const CreateAccountScreen({super.key});
+
+  @override
+  State<CreateAccountScreen> createState() => _CreateAccountScreenState();
+}
+
+class _CreateAccountScreenState extends State<CreateAccountScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailCtrl = TextEditingController();
+  final _passwordCtrl = TextEditingController();
+  final _confirmPasswordCtrl = TextEditingController();
+  bool _submitting = false;
+
+  bool _looksLikeEmail(String value) {
+    return RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(value);
+  }
+
+  String _messageForAuthError(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'email-already-in-use':
+        return 'That email is already in use.';
+      case 'invalid-email':
+        return 'Enter a valid email address.';
+      case 'weak-password':
+        return 'Password must be at least 6 characters.';
+      case 'operation-not-allowed':
+        return 'Email/password sign-up is not enabled in Firebase Auth yet.';
+      case 'network-request-failed':
+        return 'Network error while creating account. Check the emulator/device connection and Firebase setup, then try again.';
+      case 'too-many-requests':
+        return 'Too many attempts. Please wait a moment and try again.';
+      case 'invalid-credential':
+        return 'That account request could not be completed. Please verify your details and try again.';
+      default:
+        return e.message ?? 'Could not create account. Please try again.';
+    }
+  }
+
+  Future<void> _submit() async {
+    if (_submitting) return;
+    final form = _formKey.currentState;
+    if (form == null || !form.validate()) return;
+
+    setState(() => _submitting = true);
+
+    try {
+      await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: _emailCtrl.text.trim(),
+        password: _passwordCtrl.text,
+      );
+      if (!mounted) return;
+      Navigator.pop(context, true);
+    } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(_messageForAuthError(e))));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not create account. Please try again.'),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _emailCtrl.dispose();
+    _passwordCtrl.dispose();
+    _confirmPasswordCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Create account')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            const Text(
+              'Create your account to start building your collection.',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Guest mode lets you test scanning and search. Create an account to save cards and track your Pokedex.',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.72),
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Form(
+              key: _formKey,
+              child: Column(
+                children: [
+                  TextFormField(
+                    controller: _emailCtrl,
+                    keyboardType: TextInputType.emailAddress,
+                    autofillHints: const [AutofillHints.email],
+                    decoration: const InputDecoration(labelText: 'Email'),
+                    validator: (value) {
+                      final email = (value ?? '').trim();
+                      if (email.isEmpty) return 'Enter your email.';
+                      if (!_looksLikeEmail(email)) {
+                        return 'Enter a valid email address.';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _passwordCtrl,
+                    obscureText: true,
+                    autofillHints: const [AutofillHints.newPassword],
+                    decoration: const InputDecoration(labelText: 'Password'),
+                    validator: (value) {
+                      final password = value ?? '';
+                      if (password.isEmpty) return 'Enter a password.';
+                      if (password.length < 6) {
+                        return 'Password must be at least 6 characters.';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _confirmPasswordCtrl,
+                    obscureText: true,
+                    autofillHints: const [AutofillHints.password],
+                    decoration: const InputDecoration(
+                      labelText: 'Confirm password',
+                    ),
+                    validator: (value) {
+                      final confirmPassword = value ?? '';
+                      if (confirmPassword.isEmpty) {
+                        return 'Confirm your password.';
+                      }
+                      if (confirmPassword != _passwordCtrl.text) {
+                        return 'Passwords do not match.';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: _submitting ? null : _submit,
+                      child: _submitting
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Text('Create account'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class SignInScreen extends StatefulWidget {
+  const SignInScreen({super.key});
+
+  @override
+  State<SignInScreen> createState() => _SignInScreenState();
+}
+
+class _SignInScreenState extends State<SignInScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _emailCtrl = TextEditingController();
+  final _passwordCtrl = TextEditingController();
+  bool _submitting = false;
+
+  bool _looksLikeEmail(String value) {
+    return RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(value);
+  }
+
+  String _messageForAuthError(FirebaseAuthException e) {
+    switch (e.code) {
+      case 'invalid-email':
+        return 'Enter a valid email address.';
+      case 'user-not-found':
+        return 'No account was found for that email.';
+      case 'wrong-password':
+        return 'Incorrect password.';
+      case 'invalid-credential':
+        return 'Incorrect email or password.';
+      case 'operation-not-allowed':
+        return 'Email/password sign-in is not enabled in Firebase Auth yet.';
+      case 'network-request-failed':
+        return 'Network error while signing in. Check the emulator/device connection and Firebase setup, then try again.';
+      case 'too-many-requests':
+        return 'Too many attempts. Please try again shortly.';
+      default:
+        return e.message ?? 'Could not sign in. Please try again.';
+    }
+  }
+
+  Future<void> _submit() async {
+    if (_submitting) return;
+    final form = _formKey.currentState;
+    if (form == null || !form.validate()) return;
+
+    setState(() => _submitting = true);
+
+    try {
+      await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: _emailCtrl.text.trim(),
+        password: _passwordCtrl.text,
+      );
+      if (!mounted) return;
+      Navigator.pop(context, true);
+    } on FirebaseAuthException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(_messageForAuthError(e))));
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not sign in. Please try again.')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _emailCtrl.dispose();
+    _passwordCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Sign in')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            const Text(
+              'Sign in to your collection.',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Use your existing account to restore collection access and keep saving cards.',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.72),
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 20),
+            Form(
+              key: _formKey,
+              child: Column(
+                children: [
+                  TextFormField(
+                    controller: _emailCtrl,
+                    keyboardType: TextInputType.emailAddress,
+                    autofillHints: const [AutofillHints.username],
+                    decoration: const InputDecoration(labelText: 'Email'),
+                    validator: (value) {
+                      final email = (value ?? '').trim();
+                      if (email.isEmpty) return 'Enter your email.';
+                      if (!_looksLikeEmail(email)) {
+                        return 'Enter a valid email address.';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _passwordCtrl,
+                    obscureText: true,
+                    autofillHints: const [AutofillHints.password],
+                    decoration: const InputDecoration(labelText: 'Password'),
+                    validator: (value) {
+                      final password = value ?? '';
+                      if (password.isEmpty) return 'Enter your password.';
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: _submitting ? null : _submit,
+                      child: _submitting
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Text('Sign in'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
   await Hive.initFlutter();
+
   await PokemonTcgApi.initCache();
-  collectionStore.seedDemoIfEmpty();
+  await collectionStore.setPersistentCollectionAccessEnabled(
+    _hasPersistentCollectionAccess(FirebaseAuth.instance.currentUser),
+  );
 
   final api = PokemonTcgApi();
-  await api.debugHealthCheck();
+  unawaited(api.debugHealthCheck());
 
   final cameras = await availableCameras();
   gCameras = cameras;
@@ -35,7 +547,7 @@ extension CardTypeLabel on CardType {
   String get label => this == CardType.pokemon ? 'Pokémon' : 'Sports';
 }
 
-// Shared grayscale matrix (keep for Pokédex + missing tiles ONLY)
+// Shared grayscale matrix (keep for PokÃ©dex + missing tiles ONLY)
 const List<double> kGreyMatrix = <double>[
   0.2126,
   0.7152,
@@ -120,17 +632,45 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _index = 0;
+  late final StreamSubscription<User?> _authSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
+      unawaited(
+        collectionStore.setPersistentCollectionAccessEnabled(
+          _hasPersistentCollectionAccess(user),
+        ),
+      );
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSubscription.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final tabs = <Widget>[
+    final tabs = [
       HomeScreen(cameras: widget.cameras),
       const CollectionScreen(),
+      const ProfileScreen(), // âœ… NEW
       const SettingsScreen(),
     ];
 
     return Scaffold(
-      body: IndexedStack(index: _index, children: tabs),
+      body: Stack(
+        children: [
+          const Positioned.fill(child: AnimatedBackground()),
+          IndexedStack(index: _index, children: tabs),
+          const XpOverlay(),
+          const AchievementOverlay(),
+          const PokedexRegisteredOverlay(),
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
         onDestinationSelected: (i) => setState(() => _index = i),
@@ -139,6 +679,10 @@ class _AppShellState extends State<AppShell> {
           NavigationDestination(
             icon: Icon(Icons.collections_bookmark_outlined),
             label: 'Collection',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.person_outline),
+            label: 'Profile',
           ),
           NavigationDestination(
             icon: Icon(Icons.settings_outlined),
@@ -150,96 +694,1212 @@ class _AppShellState extends State<AppShell> {
   }
 }
 
-class SettingsScreen extends StatelessWidget {
-  const SettingsScreen({super.key});
+class ProfileScreen extends StatelessWidget {
+  const ProfileScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
-      body: Center(
-        child: Text(
-          'Settings / Account (coming soon)',
-          textAlign: TextAlign.center,
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      initialData: FirebaseAuth.instance.currentUser,
+      builder: (context, authSnapshot) {
+        final user = authSnapshot.data;
+        return AnimatedBuilder(
+          animation: collectionStore.profileViewVersion,
+          builder: (context, _) {
+            final level = collectionStore.level;
+            final progress = collectionStore.levelProgress.clamp(0.0, 1.0);
+            final xpInto = collectionStore.xpIntoLevel;
+            final totalXp = collectionStore.totalXp;
+            final streak = collectionStore.streak;
+            final scans = collectionStore.totalScans;
+            final cardsOwned = collectionStore.uniqueRegisteredCount;
+            final estValue = collectionStore.totalMarketValue;
+            final missingMarketValueCount =
+                collectionStore.missingMarketValueCardCount;
+            final allMarketValuesRefreshed =
+                collectionStore.allMarketValuesRefreshed;
+            final recentItems = collectionStore.recentUniqueItems(limit: 4);
+            final summaries = collectionStore.getSetSummariesView();
+            final unlockedAchievements = collectionStore.unlockedAchievements;
+            final knownTotalSlots = summaries.fold<int>(
+              0,
+              (sum, s) =>
+                  sum +
+                  ((s.printedTotal != null && s.printedTotal! > 0)
+                      ? s.printedTotal!
+                      : 0),
+            );
+            final ownedRegisteredSlots = summaries.fold<int>(
+              0,
+              (sum, s) => sum + s.ownedUniqueSlots,
+            );
+            final estimatedProgressValue = knownTotalSlots > 0
+                ? (ownedRegisteredSlots / knownTotalSlots).clamp(0.0, 1.0)
+                : (cardsOwned / 50).clamp(0.0, 1.0);
+            final progressPercent = (estimatedProgressValue * 100).round();
+            final hasDuplicateCard = collectionStore.hasDuplicateCard;
+            final startedSetCount = collectionStore.startedSetCount;
+            final completedSetCount = collectionStore.completedSetCount;
+            final bestSetProgressPercent =
+                (collectionStore.bestSetProgress * 100).round();
+            final hasHighValueCard = collectionStore.hasHighValueCard;
+            final achievementCards = <_ProfileAchievementData>[
+              _ProfileAchievementData(
+                id: CollectionStore.achievementFirstScan,
+                title: 'First Card Registered',
+                tileLabel: 'First Card',
+                subtitle: scans > 0
+                    ? 'Your collection has begun'
+                    : 'Save your first card',
+                icon: Icons.style_outlined,
+                progress: scans > 0 ? 1 : 0,
+                tier: _AchievementVisualTier.bronze,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementFirstScan,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementScan10,
+                title: '5 Cards Registered',
+                tileLabel: '5 Cards',
+                subtitle: '$scans / 5 cards registered',
+                icon: Icons.collections_bookmark_outlined,
+                progress: (scans / 5).clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.bronze,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementScan10,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementScan25,
+                title: '25 Cards Registered',
+                tileLabel: '25 Cards',
+                subtitle: '$scans / 25 cards registered',
+                icon: Icons.library_books_outlined,
+                progress: (scans / 25).clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.gold,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementScan25,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementFirstUnique,
+                title: 'First Pokedex Slot Filled',
+                tileLabel: 'First Slot',
+                subtitle: ownedRegisteredSlots > 0
+                    ? 'Your first slot is registered'
+                    : 'Fill your first Pokedex slot',
+                icon: Icons.grid_view_rounded,
+                progress: ownedRegisteredSlots > 0 ? 1 : 0,
+                tier: _AchievementVisualTier.bronze,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementFirstUnique,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementUnique10,
+                title: '10 Pokedex Slots Filled',
+                tileLabel: '10 Slots',
+                subtitle: '$ownedRegisteredSlots / 10 Pokedex slots filled',
+                icon: Icons.apps_rounded,
+                progress: (ownedRegisteredSlots / 10).clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.silver,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementUnique10,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementFirstDuplicate,
+                title: 'First Duplicate',
+                tileLabel: 'Duplicate',
+                subtitle: hasDuplicateCard
+                    ? 'Second copy secured'
+                    : 'Register a second copy of any card',
+                icon: Icons.copy_all_outlined,
+                progress: hasDuplicateCard ? 1 : (scans / 2).clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.bronze,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementFirstDuplicate,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementSetStarted,
+                title: 'First Set Started',
+                tileLabel: 'Start Set',
+                subtitle: startedSetCount > 0
+                    ? '$startedSetCount set${startedSetCount == 1 ? '' : 's'} underway'
+                    : 'Register a card from any set',
+                icon: Icons.view_module_outlined,
+                progress: startedSetCount > 0 ? 1 : 0,
+                tier: _AchievementVisualTier.bronze,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementSetStarted,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementSet25,
+                title: 'First Set at 25%',
+                tileLabel: 'Set 25%',
+                subtitle: '$bestSetProgressPercent% / 25% best set progress',
+                icon: Icons.donut_small_outlined,
+                progress: (collectionStore.bestSetProgress / 0.25).clamp(
+                  0.0,
+                  1.0,
+                ),
+                tier: _AchievementVisualTier.silver,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementSet25,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementSet50,
+                title: 'First Set at 50%',
+                tileLabel: 'Set 50%',
+                subtitle: '$bestSetProgressPercent% / 50% best set progress',
+                icon: Icons.pie_chart_outline_rounded,
+                progress: (collectionStore.bestSetProgress / 0.50).clamp(
+                  0.0,
+                  1.0,
+                ),
+                tier: _AchievementVisualTier.gold,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementSet50,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementSetComplete,
+                title: 'First Set Completed',
+                tileLabel: 'Set Complete',
+                subtitle: completedSetCount > 0
+                    ? '$completedSetCount set${completedSetCount == 1 ? '' : 's'} completed'
+                    : '$bestSetProgressPercent% best set progress',
+                icon: Icons.emoji_events_outlined,
+                progress: completedSetCount > 0
+                    ? 1
+                    : collectionStore.bestSetProgress.clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.gold,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementSetComplete,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementStreak3,
+                title: '3-Day Scan Streak',
+                tileLabel: '3-Day',
+                subtitle: '$streak / 3 days in a row',
+                icon: Icons.whatshot_outlined,
+                progress: (streak / 3).clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.silver,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementStreak3,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementStreak7,
+                title: '7-Day Scan Streak',
+                tileLabel: '7-Day',
+                subtitle: '$streak / 7 days in a row',
+                icon: Icons.local_fire_department_outlined,
+                progress: (streak / 7).clamp(0.0, 1.0),
+                tier: _AchievementVisualTier.gold,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementStreak7,
+                ),
+              ),
+              _ProfileAchievementData(
+                id: CollectionStore.achievementHighValue,
+                title: 'First \$20+ Card',
+                tileLabel: '\$20+ Card',
+                subtitle: hasHighValueCard
+                    ? '\$20+ card registered'
+                    : 'Register a card worth \$20 or more',
+                icon: Icons.attach_money_rounded,
+                progress: hasHighValueCard ? 1 : 0,
+                tier: _AchievementVisualTier.gold,
+                unlocked: unlockedAchievements.contains(
+                  CollectionStore.achievementHighValue,
+                ),
+              ),
+            ];
+
+            return Scaffold(
+              appBar: AppBar(title: const Text('Trainer Profile')),
+              body: ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(28),
+                      gradient: const LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [Color(0xFF17325B), Color(0xFF0D1629)],
+                      ),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.22),
+                          blurRadius: 22,
+                          offset: const Offset(0, 12),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.white.withOpacity(0.10),
+                                border: Border.all(
+                                  color: Colors.white.withOpacity(0.14),
+                                ),
+                              ),
+                              child: const Icon(
+                                Icons.catching_pokemon,
+                                size: 34,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'TRAINER PROFILE',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 1.4,
+                                      color: Colors.white.withOpacity(0.72),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  const Text(
+                                    'Trainer Profile',
+                                    style: TextStyle(
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.w900,
+                                      height: 1.0,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    'Level $level • $streak day streak',
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white.withOpacity(0.8),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          '$totalXp XP',
+                          style: const TextStyle(
+                            fontSize: 34,
+                            fontWeight: FontWeight.w900,
+                            height: 1,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          '$xpInto / 500 XP toward Level ${level + 1}',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white.withOpacity(0.78),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(999),
+                          child: LinearProgressIndicator(
+                            value: progress,
+                            minHeight: 12,
+                            backgroundColor: Colors.white.withOpacity(0.08),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _ProfileMiniStat(
+                                label: 'Streak',
+                                value: '$streak',
+                                accent: const Color(0xFFF59E0B),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: _ProfileMiniStat(
+                                label: 'Scans',
+                                value: '$scans',
+                                accent: const Color(0xFF38BDF8),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(18),
+                            border: Border.all(
+                              color: Colors.white.withOpacity(0.08),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                user == null
+                                    ? Icons.person_outline
+                                    : Icons.verified_user_outlined,
+                                size: 18,
+                                color: Colors.white.withOpacity(0.82),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _accountStatusTitle(user),
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      user == null
+                                          ? 'Guest testing only.'
+                                          : _accountIdentifier(user),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: Colors.white.withOpacity(0.72),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      _accountOwnershipExplanation(user),
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        height: 1.35,
+                                        color: Colors.white.withOpacity(0.62),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              _buildAccountActionButtons(context, user),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  const _ProfileSectionTitle(
+                    title: 'Collection Progress',
+                    subtitle:
+                        'Your Pokédex journey across scanned cards and set slots.',
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      color: const Color(0xFF111A2E),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Cards Owned',
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    '$cardsOwned',
+                                    style: const TextStyle(
+                                      fontSize: 32,
+                                      fontWeight: FontWeight.w900,
+                                      height: 1,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.06),
+                                borderRadius: BorderRadius.circular(18),
+                              ),
+                              child: Column(
+                                children: [
+                                  Text(
+                                    '$progressPercent%',
+                                    style: const TextStyle(
+                                      fontSize: 22,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    knownTotalSlots > 0
+                                        ? 'registered'
+                                        : 'estimate',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w800,
+                                      color: Colors.white.withOpacity(0.68),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          knownTotalSlots > 0
+                              ? '$ownedRegisteredSlots / $knownTotalSlots known set slots filled'
+                              : 'Using a safe milestone estimate until more full set totals are known.',
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white.withOpacity(0.78),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(999),
+                          child: LinearProgressIndicator(
+                            value: estimatedProgressValue,
+                            minHeight: 12,
+                            backgroundColor: Colors.white.withOpacity(0.08),
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _ProfileMiniStat(
+                                label: 'Collection Value',
+                                value: '\$${estValue.toStringAsFixed(0)}',
+                                accent: const Color(0xFF34D399),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: _ProfileMiniStat(
+                                label: 'Sets Tracked',
+                                value: '${summaries.length}',
+                                accent: const Color(0xFFA78BFA),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: TextButton.icon(
+                            onPressed:
+                                collectionStore.marketValueRefreshInProgress
+                                ? null
+                                : () async {
+                                    final beforeMissing = collectionStore
+                                        .missingMarketValueCardCount;
+                                    collectionStore.configureMarketValueRefresh(
+                                      queryBuilder: (card) => buildEbayQuery(
+                                        name: card.name,
+                                        setName: card.setName,
+                                        number: card.number,
+                                        printedTotal: card.setPrintedTotal,
+                                        mode: EbayMode.raw,
+                                      ),
+                                      fetcher: fetchEbayMarketValue,
+                                    );
+
+                                    final refreshed = await collectionStore
+                                        .refreshMissingMarketValues(limit: 5);
+                                    final afterMissing = collectionStore
+                                        .missingMarketValueCardCount;
+
+                                    if (!context.mounted) return;
+                                    final message = afterMissing == 0
+                                        ? (beforeMissing > 0
+                                              ? 'Updated $refreshed card${refreshed == 1 ? '' : 's'}. All market values refreshed.'
+                                              : 'All market values are already refreshed.')
+                                        : refreshed > 0
+                                        ? 'Updated $refreshed card${refreshed == 1 ? '' : 's'}. $afterMissing still missing values.'
+                                        : 'No missing market values were updated. $afterMissing still missing values.';
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(content: Text(message)),
+                                    );
+                                  },
+                            icon: collectionStore.marketValueRefreshInProgress
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(Icons.refresh_rounded, size: 16),
+                            label: Text(
+                              collectionStore.marketValueRefreshInProgress
+                                  ? 'Refreshing market values...'
+                                  : 'Refresh market values',
+                            ),
+                            style: TextButton.styleFrom(
+                              foregroundColor: const Color(0xFF7DD3FC),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 2,
+                                vertical: 2,
+                              ),
+                            ),
+                          ),
+                        ),
+                        if (missingMarketValueCount > 0) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            missingMarketValueCount == 1
+                                ? '1 card is still missing a market value.'
+                                : '$missingMarketValueCount cards are still missing market values.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white.withOpacity(0.68),
+                            ),
+                          ),
+                        ] else if (allMarketValuesRefreshed) ...[
+                          const SizedBox(height: 4),
+                          Text(
+                            'All market values are refreshed.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: const Color(0xFF86EFAC).withOpacity(0.82),
+                            ),
+                          ),
+                        ],
+                        if (kDebugMode) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            collectionStore.cloudSyncComplete
+                                ? 'Cloud sync complete'
+                                : 'Cloud sync pending',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(color: Colors.white70),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  const _ProfileSectionTitle(
+                    title: 'Recently Collected',
+                    subtitle: 'Your latest captures, fresh from the scanner.',
+                  ),
+                  const SizedBox(height: 10),
+                  if (recentItems.isEmpty)
+                    Container(
+                      padding: const EdgeInsets.all(18),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(24),
+                        color: const Color(0xFF111A2E),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.08),
+                        ),
+                      ),
+                      child: Text(
+                        'No recent cards yet. Scan a card to start building your trainer story.',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.74),
+                          fontWeight: FontWeight.w600,
+                          height: 1.4,
+                        ),
+                      ),
+                    )
+                  else
+                    SizedBox(
+                      height: 188,
+                      child: ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: recentItems.length,
+                        separatorBuilder: (_, __) => const SizedBox(width: 12),
+                        itemBuilder: (context, index) {
+                          return _RecentCollectedCard(
+                            entry: recentItems[index],
+                          );
+                        },
+                      ),
+                    ),
+                  const SizedBox(height: 18),
+                  const _ProfileSectionTitle(
+                    title: 'Achievements',
+                    subtitle:
+                        'Milestones for your binder, sets, and collecting streaks.',
+                  ),
+                  const SizedBox(height: 10),
+                  GridView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3,
+                          mainAxisSpacing: 8,
+                          crossAxisSpacing: 8,
+                          childAspectRatio: 0.88,
+                        ),
+                    itemCount: achievementCards.length,
+                    itemBuilder: (context, index) {
+                      return _AchievementTile(data: achievementCards[index]);
+                    },
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _ProfileSectionTitle extends StatelessWidget {
+  final String title;
+  final String subtitle;
+
+  const _ProfileSectionTitle({required this.title, required this.subtitle});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
         ),
+        const SizedBox(height: 4),
+        Text(
+          subtitle,
+          style: TextStyle(
+            color: Colors.white.withOpacity(0.72),
+            fontWeight: FontWeight.w600,
+            height: 1.35,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ProfileMiniStat extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color accent;
+
+  const _ProfileMiniStat({
+    required this.label,
+    required this.value,
+    required this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.7),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-class HomeScreen extends StatelessWidget {
-  final List<CameraDescription> cameras;
-  const HomeScreen({super.key, required this.cameras});
+class _RecentCollectedCard extends StatelessWidget {
+  final CollectionEntry entry;
+
+  const _RecentCollectedCard({required this.entry});
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
+    final imageUrl = entry.card.imageSmall.isNotEmpty
+        ? entry.card.imageSmall
+        : entry.card.imageLarge;
+
+    return Container(
+      width: 138,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(22),
+        color: const Color(0xFF111A2E),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: imageUrl.isEmpty
+                  ? Container(
+                      color: Colors.white.withOpacity(0.05),
+                      child: const Center(
+                        child: Icon(
+                          Icons.style_outlined,
+                          color: Colors.white54,
+                        ),
+                      ),
+                    )
+                  : Image.network(
+                      imageUrl,
+                      width: double.infinity,
+                      fit: BoxFit.cover,
+                    ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            entry.card.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            entry.card.setName.isNotEmpty
+                ? '${entry.card.setName} - #${entry.card.number}'
+                : '#${entry.card.number}',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.68),
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ProfileAchievementData {
+  final String id;
+  final String title;
+  final String tileLabel;
+  final String subtitle;
+  final IconData icon;
+  final bool unlocked;
+  final double progress;
+  final _AchievementVisualTier tier;
+
+  const _ProfileAchievementData({
+    required this.id,
+    required this.title,
+    required this.tileLabel,
+    required this.subtitle,
+    required this.icon,
+    required this.unlocked,
+    required this.progress,
+    required this.tier,
+  });
+}
+
+enum _AchievementVisualTier { bronze, silver, gold }
+
+class _AchievementVisualSpec {
+  final IconData icon;
+  final _AchievementVisualTier tier;
+
+  const _AchievementVisualSpec({required this.icon, required this.tier});
+}
+
+_AchievementVisualSpec _achievementVisualSpecForId(String id) {
+  switch (id) {
+    case CollectionStore.achievementFirstScan:
+      return const _AchievementVisualSpec(
+        icon: Icons.style_outlined,
+        tier: _AchievementVisualTier.bronze,
+      );
+    case CollectionStore.achievementScan10:
+      return const _AchievementVisualSpec(
+        icon: Icons.collections_bookmark_outlined,
+        tier: _AchievementVisualTier.bronze,
+      );
+    case CollectionStore.achievementScan25:
+      return const _AchievementVisualSpec(
+        icon: Icons.library_books_outlined,
+        tier: _AchievementVisualTier.gold,
+      );
+    case CollectionStore.achievementFirstUnique:
+      return const _AchievementVisualSpec(
+        icon: Icons.grid_view_rounded,
+        tier: _AchievementVisualTier.bronze,
+      );
+    case CollectionStore.achievementUnique10:
+      return const _AchievementVisualSpec(
+        icon: Icons.apps_rounded,
+        tier: _AchievementVisualTier.silver,
+      );
+    case CollectionStore.achievementFirstDuplicate:
+      return const _AchievementVisualSpec(
+        icon: Icons.copy_all_outlined,
+        tier: _AchievementVisualTier.bronze,
+      );
+    case CollectionStore.achievementSetStarted:
+      return const _AchievementVisualSpec(
+        icon: Icons.view_module_outlined,
+        tier: _AchievementVisualTier.bronze,
+      );
+    case CollectionStore.achievementSet25:
+      return const _AchievementVisualSpec(
+        icon: Icons.donut_small_outlined,
+        tier: _AchievementVisualTier.silver,
+      );
+    case CollectionStore.achievementSet50:
+      return const _AchievementVisualSpec(
+        icon: Icons.pie_chart_outline_rounded,
+        tier: _AchievementVisualTier.gold,
+      );
+    case CollectionStore.achievementSetComplete:
+      return const _AchievementVisualSpec(
+        icon: Icons.emoji_events_outlined,
+        tier: _AchievementVisualTier.gold,
+      );
+    case CollectionStore.achievementStreak3:
+      return const _AchievementVisualSpec(
+        icon: Icons.whatshot_outlined,
+        tier: _AchievementVisualTier.silver,
+      );
+    case CollectionStore.achievementStreak7:
+      return const _AchievementVisualSpec(
+        icon: Icons.local_fire_department_outlined,
+        tier: _AchievementVisualTier.gold,
+      );
+    case CollectionStore.achievementHighValue:
+      return const _AchievementVisualSpec(
+        icon: Icons.attach_money_rounded,
+        tier: _AchievementVisualTier.gold,
+      );
+    default:
+      return const _AchievementVisualSpec(
+        icon: Icons.workspace_premium_rounded,
+        tier: _AchievementVisualTier.bronze,
+      );
+  }
+}
+
+String? _achievementDescriptionForId(String id) {
+  switch (id) {
+    case CollectionStore.achievementFirstScan:
+      return 'Your collection journey has officially started.';
+    case CollectionStore.achievementScan10:
+      return 'You are building real scanning momentum.';
+    case CollectionStore.achievementScan25:
+      return 'Your binder is starting to look serious.';
+    case CollectionStore.achievementFirstUnique:
+      return 'A brand new card joins your collection.';
+    case CollectionStore.achievementUnique10:
+      return 'Ten unique cards collected and counting.';
+    case CollectionStore.achievementFirstDuplicate:
+      return 'You found your first duplicate pull.';
+    case CollectionStore.achievementSetStarted:
+      return 'A set is now on its way to completion.';
+    case CollectionStore.achievementSet25:
+      return 'You are a quarter of the way through a set.';
+    case CollectionStore.achievementSet50:
+      return 'Halfway there. The finish line is in sight.';
+    case CollectionStore.achievementSetComplete:
+      return 'A full set is complete. Huge collector moment.';
+    case CollectionStore.achievementStreak3:
+      return 'Three straight days of collection progress.';
+    case CollectionStore.achievementStreak7:
+      return 'A full week streak. Momentum locked in.';
+    case CollectionStore.achievementHighValue:
+      return 'You found a card with standout market value.';
+    default:
+      return null;
+  }
+}
+
+_AchievementPalette _achievementPaletteFor({
+  required bool unlocked,
+  required _AchievementVisualTier tier,
+  required double progress,
+}) {
+  if (!unlocked) {
+    return const _AchievementPalette(
+      medal: [Color(0xFF414857), Color(0xFF252B38)],
+      surface: Color(0x0D161D2C),
+      ring: Color(0xFF5D6676),
+      track: Color(0x1A5D6676),
+      icon: Color(0xFF9CA3AF),
+      glow: Color(0xFF9CA3AF),
+    );
+  }
+
+  switch (tier) {
+    case _AchievementVisualTier.bronze:
+      return const _AchievementPalette(
+        medal: [Color(0xFFF5B97A), Color(0xFF9B5D2E)],
+        surface: Color(0x12E8A06B),
+        ring: Color(0xFFE8A06B),
+        track: Color(0x33E8A06B),
+        icon: Color(0xFFFFF3E6),
+        glow: Color(0xFFE8A06B),
+      );
+    case _AchievementVisualTier.silver:
+      if (progress >= 1) {
+        return const _AchievementPalette(
+          medal: [Color(0xFFF3F6FA), Color(0xFF9AA6B8)],
+          surface: Color(0x12C7D2DF),
+          ring: Color(0xFFC7D2DF),
+          track: Color(0x33C7D2DF),
+          icon: Color(0xFFFFFFFF),
+          glow: Color(0xFFC7D2DF),
+        );
+      }
+      return const _AchievementPalette(
+        medal: [Color(0xFFDCE3ED), Color(0xFF7F8CA0)],
+        surface: Color(0x12AFBCCB),
+        ring: Color(0xFFAFBCCB),
+        track: Color(0x33AFBCCB),
+        icon: Color(0xFFF8FAFC),
+        glow: Color(0xFFAFBCCB),
+      );
+    case _AchievementVisualTier.gold:
+      if (progress >= 1) {
+        return const _AchievementPalette(
+          medal: [Color(0xFFFFF1A8), Color(0xFFF2B938)],
+          surface: Color(0x14F5C84C),
+          ring: Color(0xFFF5C84C),
+          track: Color(0x33F5C84C),
+          icon: Color(0xFFFFFFFF),
+          glow: Color(0xFFF5C84C),
+        );
+      }
+      return const _AchievementPalette(
+        medal: [Color(0xFFF6D97A), Color(0xFFB78925)],
+        surface: Color(0x12D9B455),
+        ring: Color(0xFFD9B455),
+        track: Color(0x33D9B455),
+        icon: Color(0xFFFFF8E1),
+        glow: Color(0xFFD9B455),
+      );
+  }
+}
+
+class _AchievementTile extends StatelessWidget {
+  final _ProfileAchievementData data;
+
+  const _AchievementTile({required this.data});
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = data.progress.clamp(0.0, 1.0);
+    final palette = _achievementPaletteFor(
+      unlocked: data.unlocked,
+      tier: data.tier,
+      progress: progress,
+    );
+    final foreground = data.unlocked
+        ? Colors.white
+        : Colors.white.withOpacity(0.58);
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: () async {
+          await showDialog<void>(
+            context: context,
+            builder: (context) {
+              return Dialog(
+                backgroundColor: Colors.transparent,
+                insetPadding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 24,
+                ),
+                child: Container(
+                  padding: const EdgeInsets.fromLTRB(20, 22, 20, 12),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(30),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [Color(0xFF15213B), Color(0xFF0A101C)],
+                    ),
+                    border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    boxShadow: [
+                      BoxShadow(
+                        color: palette.glow.withOpacity(0.16),
+                        blurRadius: 28,
+                        offset: const Offset(0, 14),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _AchievementMedal(
+                        palette: palette,
+                        progress: progress,
+                        unlocked: data.unlocked,
+                        icon: data.icon,
+                        size: 108,
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        data.title,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        data.subtitle,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.72),
+                          fontWeight: FontWeight.w600,
+                          height: 1.35,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(999),
+                          color: palette.surface,
+                          border: Border.all(color: palette.track),
+                        ),
+                        child: Text(
+                          data.unlocked
+                              ? 'Unlocked'
+                              : '${(progress * 100).round()}% progress',
+                          style: TextStyle(
+                            color: palette.icon,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('Close'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+        child: Ink(
+          padding: const EdgeInsets.fromLTRB(4, 8, 4, 6),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text(
-                    'CardScan',
-                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Account coming soon')),
-                      );
-                    },
-                    icon: const Icon(Icons.person_outline),
-                    label: const Text('Sign in'),
-                  ),
-                ],
+              _AchievementMedal(
+                palette: palette,
+                progress: progress,
+                unlocked: data.unlocked,
+                icon: data.icon,
+                size: 82,
               ),
-              const SizedBox(height: 18),
-              const Text(
-                'Scan or search a card to get prices and save it to your collection.',
-                style: TextStyle(fontSize: 14),
-              ),
-              const Spacer(),
-              SizedBox(
-                height: 58,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.camera_alt),
-                  label: const Text('Scan your card'),
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => ScanScreen(cameras: cameras),
-                      ),
-                    );
-                  },
-                ),
-              ),
-              const SizedBox(height: 12),
-              SizedBox(
-                height: 58,
-                child: OutlinedButton.icon(
-                  icon: const Icon(Icons.search),
-                  label: const Text('Search manually'),
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const ManualSearchScreen(),
-                      ),
-                    );
-                  },
-                ),
-              ),
-              const SizedBox(height: 18),
-              const Text(
-                'Tip: Manual search is best when scanning is blurry or the set/number is missing.',
+              const SizedBox(height: 6),
+              Text(
+                data.tileLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: foreground,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.1,
+                ),
               ),
-              const Spacer(),
             ],
           ),
         ),
@@ -248,6 +1908,1823 @@ class HomeScreen extends StatelessWidget {
   }
 }
 
+class _AchievementMedal extends StatelessWidget {
+  final _AchievementPalette palette;
+  final double progress;
+  final bool unlocked;
+  final IconData icon;
+  final double size;
+
+  const _AchievementMedal({
+    required this.palette,
+    required this.progress,
+    required this.unlocked,
+    required this.icon,
+    required this.size,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final clampedProgress = progress.clamp(0.0, 1.0);
+    final medalSize = size * 0.68;
+    final iconSize = size * 0.29;
+
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          IgnorePointer(
+            child: Container(
+              width: size,
+              height: size,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: RadialGradient(
+                  center: const Alignment(0, -0.08),
+                  radius: 0.78,
+                  colors: [
+                    palette.glow.withOpacity(unlocked ? 0.28 : 0.03),
+                    palette.surface,
+                    Colors.transparent,
+                  ],
+                  stops: const [0.0, 0.5, 1.0],
+                ),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: size,
+            height: size,
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0, end: clampedProgress),
+              duration: const Duration(milliseconds: 600),
+              curve: Curves.easeOutCubic,
+              builder: (context, value, _) {
+                return CircularProgressIndicator(
+                  value: value,
+                  strokeWidth: size * 0.05,
+                  backgroundColor: palette.track,
+                  valueColor: AlwaysStoppedAnimation<Color>(palette.ring),
+                );
+              },
+            ),
+          ),
+          Container(
+            width: medalSize,
+            height: medalSize,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: RadialGradient(
+                center: const Alignment(-0.22, -0.24),
+                radius: 0.94,
+                colors: palette.medal,
+              ),
+              border: Border.all(
+                color: palette.ring.withOpacity(unlocked ? 0.95 : 0.72),
+                width: 1.8,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: palette.glow.withOpacity(unlocked ? 0.28 : 0.08),
+                  blurRadius: 16,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            alignment: Alignment.center,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                Positioned(
+                  top: medalSize * 0.16,
+                  child: Container(
+                    width: medalSize * 0.32,
+                    height: medalSize * 0.12,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(999),
+                      color: Colors.white.withOpacity(unlocked ? 0.26 : 0.08),
+                    ),
+                  ),
+                ),
+                Icon(
+                  Icons.workspace_premium_rounded,
+                  color: Colors.white.withOpacity(unlocked ? 0.12 : 0.06),
+                  size: medalSize * 0.76,
+                ),
+                Icon(icon, color: palette.icon, size: iconSize),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AchievementCelebrationBanner extends StatelessWidget {
+  final String title;
+  final String? description;
+  final IconData icon;
+  final _AchievementPalette entryPalette;
+  final _AchievementPalette finalPalette;
+  final Animation<double> medalScale;
+  final Animation<double> medalTurn;
+  final Animation<double> glow;
+  final Animation<double> tierResolve;
+
+  const _AchievementCelebrationBanner({
+    required this.title,
+    this.description,
+    required this.icon,
+    required this.entryPalette,
+    required this.finalPalette,
+    required this.medalScale,
+    required this.medalTurn,
+    required this.glow,
+    required this.tierResolve,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 340),
+      child: AnimatedBuilder(
+        animation: Listenable.merge([medalScale, medalTurn, glow, tierResolve]),
+        builder: (context, _) {
+          final palette = _lerpAchievementPalette(
+            entryPalette,
+            finalPalette,
+            tierResolve.value,
+          );
+          return Container(
+            padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(32),
+              gradient: const LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Color(0xFF16213A), Color(0xFF0B111C)],
+              ),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
+              boxShadow: [
+                BoxShadow(
+                  color: palette.glow.withOpacity(0.34 * glow.value),
+                  blurRadius: 42,
+                  spreadRadius: 1.5 * glow.value,
+                  offset: const Offset(0, 16),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 170,
+                  height: 170,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Container(
+                        width: 164,
+                        height: 164,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: RadialGradient(
+                            colors: [
+                              palette.glow.withOpacity(0.34 * glow.value),
+                              palette.glow.withOpacity(0.12 * glow.value),
+                              Colors.transparent,
+                            ],
+                            stops: const [0.0, 0.58, 1.0],
+                          ),
+                        ),
+                      ),
+                      Transform.rotate(
+                        angle: medalTurn.value,
+                        child: Transform.scale(
+                          scale: medalScale.value,
+                          child: _AchievementMedal(
+                            palette: palette,
+                            progress: 1,
+                            unlocked: true,
+                            icon: icon,
+                            size: 128,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Text(
+                  'Achievement unlocked',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: palette.icon.withOpacity(0.9),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w900,
+                    height: 1.06,
+                  ),
+                ),
+                if (description != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    description!,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.76),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      height: 1.32,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _AchievementPalette {
+  final List<Color> medal;
+  final Color surface;
+  final Color ring;
+  final Color track;
+  final Color icon;
+  final Color glow;
+
+  const _AchievementPalette({
+    required this.medal,
+    required this.surface,
+    required this.ring,
+    required this.track,
+    required this.icon,
+    required this.glow,
+  });
+}
+
+class XpOverlay extends StatefulWidget {
+  const XpOverlay({super.key});
+
+  @override
+  State<XpOverlay> createState() => _XpOverlayState();
+}
+
+class _XpOverlayState extends State<XpOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _fade;
+
+  XpEvent? _event;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    );
+
+    _fade = CurvedAnimation(parent: _controller, curve: Curves.easeOut);
+
+    collectionStore.lastXpEvent.addListener(_onXpEvent);
+  }
+
+  void _onXpEvent() {
+    final e = collectionStore.lastXpEvent.value;
+    if (e == null) return;
+
+    setState(() {
+      _event = e;
+    });
+
+    _controller.forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    collectionStore.lastXpEvent.removeListener(_onXpEvent);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_event == null) return const SizedBox.shrink();
+
+    return IgnorePointer(
+      child: FadeTransition(
+        opacity: Tween(begin: 1.0, end: 0.0).animate(_fade),
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 80),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.85),
+                borderRadius: BorderRadius.circular(24),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '+${_event!.xpGained} XP',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  if (_event!.leveledUp)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 4),
+                      child: Text(
+                        'LEVEL UP!',
+                        style: TextStyle(
+                          color: Colors.orangeAccent,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AchievementOverlay extends StatefulWidget {
+  const AchievementOverlay({super.key});
+
+  @override
+  State<AchievementOverlay> createState() => _AchievementOverlayState();
+}
+
+class _AchievementOverlayState extends State<AchievementOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _fade;
+  late final Animation<double> _backdropFade;
+  late final Animation<Offset> _slide;
+  late final Animation<double> _bannerScale;
+  late final Animation<double> _medalScale;
+  late final Animation<double> _medalTurn;
+  late final Animation<double> _tierResolve;
+  late final Animation<double> _glow;
+
+  AchievementEvent? _event;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 3200),
+    );
+
+    _fade = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 14,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 60),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 26,
+      ),
+    ]).animate(_controller);
+
+    _backdropFade = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 0.6,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 12,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(0.6), weight: 58),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.6,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 30,
+      ),
+    ]).animate(_controller);
+
+    _slide = Tween<Offset>(begin: const Offset(0, -0.18), end: Offset.zero)
+        .animate(
+          CurvedAnimation(
+            parent: _controller,
+            curve: const Interval(0.0, 0.24, curve: Curves.easeOutCubic),
+          ),
+        );
+
+    _bannerScale = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.94,
+          end: 1.015,
+        ).chain(CurveTween(curve: Curves.easeOutBack)),
+        weight: 26,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.015,
+          end: 1.0,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 74,
+      ),
+    ]).animate(_controller);
+
+    _medalScale = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.38,
+          end: 1.2,
+        ).chain(CurveTween(curve: Curves.easeOutBack)),
+        weight: 28,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.2,
+          end: 1.0,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 72,
+      ),
+    ]).animate(_controller);
+
+    _medalTurn = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: -0.78,
+          end: 0.08,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 26,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.08,
+          end: 0.0,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 74,
+      ),
+    ]).animate(_controller);
+
+    _tierResolve = TweenSequence<double>([
+      TweenSequenceItem(tween: ConstantTween<double>(0), weight: 14),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOutCubic)),
+        weight: 18,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 68),
+    ]).animate(_controller);
+
+    _glow = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.16,
+          end: 1.26,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 28,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1.26), weight: 42),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.26,
+          end: 0.44,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 30,
+      ),
+    ]).animate(_controller);
+
+    _controller.addStatusListener((status) {
+      if (status == AnimationStatus.completed && mounted) {
+        setState(() => _event = null);
+      }
+    });
+
+    collectionStore.lastAchievementEvent.addListener(_onAchievementEvent);
+  }
+
+  void _onAchievementEvent() {
+    final e = collectionStore.lastAchievementEvent.value;
+    if (e == null) return;
+
+    setState(() {
+      _event = e;
+    });
+
+    _controller.forward(from: 0);
+  }
+
+  Future<void> _dismissEarly() async {
+    if (_event == null) return;
+    if (_controller.status == AnimationStatus.completed) return;
+    await _controller.animateTo(
+      1.0,
+      duration: const Duration(milliseconds: 340),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  @override
+  void dispose() {
+    collectionStore.lastAchievementEvent.removeListener(_onAchievementEvent);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Widget buildLegacy(BuildContext context) {
+    if (_event == null) return const SizedBox.shrink();
+
+    return IgnorePointer(
+      child: FadeTransition(
+        opacity: _fade,
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 138),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.88),
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(
+                  color: const Color(0xFFFF7A00).withOpacity(0.4),
+                ),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    'ðŸ”¥ Achievement Unlocked',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _event!.title,
+                    style: const TextStyle(
+                      color: Color(0xFFFFD166),
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_event == null) return const SizedBox.shrink();
+    final spec = _achievementVisualSpecForId(_event!.id);
+    final description = _achievementDescriptionForId(_event!.id);
+    final finalPalette = _achievementPaletteFor(
+      unlocked: true,
+      tier: spec.tier,
+      progress: 1,
+    );
+    final entryPalette = _achievementPaletteFor(
+      unlocked: true,
+      tier: _achievementEntryTierFor(spec.tier),
+      progress: 1,
+    );
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _dismissEarly,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: FadeTransition(
+              opacity: _backdropFade,
+              child: Container(color: Colors.black.withOpacity(0.6)),
+            ),
+          ),
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 28, 20, 0),
+                child: FadeTransition(
+                  opacity: _fade,
+                  child: SlideTransition(
+                    position: _slide,
+                    child: ScaleTransition(
+                      scale: _bannerScale,
+                      child: _AchievementCelebrationBanner(
+                        title: _event!.title,
+                        description: description,
+                        icon: spec.icon,
+                        entryPalette: entryPalette,
+                        finalPalette: finalPalette,
+                        medalScale: _medalScale,
+                        medalTurn: _medalTurn,
+                        glow: _glow,
+                        tierResolve: _tierResolve,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+_AchievementVisualTier _achievementEntryTierFor(_AchievementVisualTier tier) {
+  switch (tier) {
+    case _AchievementVisualTier.bronze:
+      return _AchievementVisualTier.bronze;
+    case _AchievementVisualTier.silver:
+      return _AchievementVisualTier.bronze;
+    case _AchievementVisualTier.gold:
+      return _AchievementVisualTier.silver;
+  }
+}
+
+_AchievementPalette _lerpAchievementPalette(
+  _AchievementPalette a,
+  _AchievementPalette b,
+  double t,
+) {
+  return _AchievementPalette(
+    medal: <Color>[
+      Color.lerp(a.medal[0], b.medal[0], t)!,
+      Color.lerp(a.medal[1], b.medal[1], t)!,
+    ],
+    surface: Color.lerp(a.surface, b.surface, t)!,
+    ring: Color.lerp(a.ring, b.ring, t)!,
+    track: Color.lerp(a.track, b.track, t)!,
+    icon: Color.lerp(a.icon, b.icon, t)!,
+    glow: Color.lerp(a.glow, b.glow, t)!,
+  );
+}
+
+class PokedexRegisteredOverlay extends StatefulWidget {
+  const PokedexRegisteredOverlay({super.key});
+
+  @override
+  State<PokedexRegisteredOverlay> createState() =>
+      _PokedexRegisteredOverlayState();
+}
+
+class _PokedexRegisteredOverlayState extends State<PokedexRegisteredOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _fade;
+  late final Animation<double> _scale;
+
+  PokedexEvent? _event;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    );
+
+    _fade = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 18,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1), weight: 50),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeIn)),
+        weight: 32,
+      ),
+    ]).animate(_controller);
+
+    _scale = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0.9,
+          end: 1.03,
+        ).chain(CurveTween(curve: Curves.easeOutBack)),
+        weight: 34,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.03,
+          end: 1.0,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 24,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(1.0), weight: 42),
+    ]).animate(_controller);
+
+    collectionStore.lastPokedexEvent.addListener(_onPokedexEvent);
+  }
+
+  void _onPokedexEvent() {
+    final e = collectionStore.lastPokedexEvent.value;
+    if (e == null) return;
+
+    setState(() {
+      _event = e;
+    });
+
+    _controller.forward(from: 0);
+  }
+
+  @override
+  void dispose() {
+    collectionStore.lastPokedexEvent.removeListener(_onPokedexEvent);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_event == null) return const SizedBox.shrink();
+
+    final imageUrl = _event!.imageUrl;
+
+    return IgnorePointer(
+      child: FadeTransition(
+        opacity: _fade,
+        child: Center(
+          child: ScaleTransition(
+            scale: _scale,
+            child: Container(
+              width: 260,
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(28),
+                border: Border.all(
+                  color: const Color(0xFF93C5FD).withOpacity(0.35),
+                ),
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    const Color(0xFF081427).withOpacity(0.96),
+                    const Color(0xFF12213F).withOpacity(0.94),
+                  ],
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF60A5FA).withOpacity(0.22),
+                    blurRadius: 28,
+                    spreadRadius: 3,
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (imageUrl.isNotEmpty)
+                    Container(
+                      width: 92,
+                      height: 128,
+                      padding: const EdgeInsets.all(4),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(18),
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Colors.white.withOpacity(0.22),
+                            const Color(0xFF93C5FD).withOpacity(0.12),
+                          ],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFFBFDBFE).withOpacity(0.18),
+                            blurRadius: 18,
+                            spreadRadius: 1,
+                          ),
+                        ],
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(14),
+                        child: Image.network(
+                          imageUrl,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) => Container(
+                            color: Colors.white.withOpacity(0.06),
+                            alignment: Alignment.center,
+                            child: const Icon(
+                              Icons.auto_awesome,
+                              color: Colors.white70,
+                              size: 32,
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                  else
+                    Container(
+                      width: 92,
+                      height: 92,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.white.withOpacity(0.08),
+                      ),
+                      alignment: Alignment.center,
+                      child: const Icon(
+                        Icons.menu_book_rounded,
+                        color: Colors.white70,
+                        size: 36,
+                      ),
+                    ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Pokédex Registered',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0.2,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    _event!.cardName,
+                    textAlign: TextAlign.center,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xFFBFDBFE),
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class SettingsScreen extends StatelessWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      initialData: FirebaseAuth.instance.currentUser,
+      builder: (context, authSnapshot) {
+        final user = authSnapshot.data;
+        return AnimatedBuilder(
+          animation: collectionStore.profileViewVersion,
+          builder: (context, _) {
+            final missingMarketValueCount =
+                collectionStore.missingMarketValueCardCount;
+            final accountDetail = user == null
+                ? 'Guest testing only.'
+                : _accountIdentifier(user);
+            final accountExplanation = _accountOwnershipExplanation(user);
+
+            return Scaffold(
+              appBar: AppBar(title: const Text('Settings')),
+              body: ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  _SettingsSection(
+                    title: 'Account',
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          width: 42,
+                          height: 42,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: Icon(
+                            user == null
+                                ? Icons.person_outline
+                                : Icons.verified_user_outlined,
+                            color: Colors.white.withOpacity(0.86),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _accountStatusTitle(user),
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                accountDetail,
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.72),
+                                  fontWeight: FontWeight.w600,
+                                  height: 1.35,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                accountExplanation,
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.68),
+                                  fontWeight: FontWeight.w600,
+                                  height: 1.35,
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              _buildAccountActionButtons(context, user),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const _SettingsSection(
+                    title: 'Data & Sync',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Your collection works locally on this device.',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        SizedBox(height: 6),
+                        Text(
+                          'When you are signed in, card data can sync to your cloud account. Some older local or demo data may not automatically move between users.',
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  _SettingsSection(
+                    title: 'Market Values',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          missingMarketValueCount > 0
+                              ? missingMarketValueCount == 1
+                                    ? '1 owned card still needs a market value refresh.'
+                                    : '$missingMarketValueCount owned cards still need market value refreshes.'
+                              : 'All currently owned cards have market values.',
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'Collection value updates over time as missing card values are refreshed.',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.72),
+                            height: 1.35,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  const _SettingsSection(
+                    title: 'About',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'PokeScan',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        SizedBox(height: 6),
+                        Text(
+                          'Scan cards, register your Pokédex, and build complete sets with confidence.',
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _SettingsSection extends StatelessWidget {
+  final String title;
+  final Widget child;
+
+  const _SettingsSection({required this.title, required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 10),
+          DefaultTextStyle(
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.82),
+              fontWeight: FontWeight.w600,
+              height: 1.35,
+            ),
+            child: child,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// HOME (state) + TILE + SCREEN (all use FeaturedCardData)
+
+class HomeScreen extends StatefulWidget {
+  final List<CameraDescription> cameras;
+  const HomeScreen({super.key, required this.cameras});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  late Future<FeaturedCardData?> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _reloadFeatured();
+  }
+
+  void _reloadFeatured() {
+    setState(() {
+      _future = FeaturedCardService.getToday();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final level = collectionStore.level;
+    final streak = collectionStore.streak;
+    final cards = collectionStore.count;
+
+    return Scaffold(
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(14),
+                    gradient: LinearGradient(
+                      colors: [
+                        Colors.white.withOpacity(0.14),
+                        Colors.white.withOpacity(0.04),
+                      ],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    border: Border.all(color: Colors.white.withOpacity(0.10)),
+                  ),
+                  child: const Icon(Icons.style_outlined),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'CardScan',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 0.2,
+                        ),
+                      ),
+                      SizedBox(height: 2),
+                      Text(
+                        'Scan. Register. Complete.',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                StreamBuilder<User?>(
+                  stream: FirebaseAuth.instance.authStateChanges(),
+                  initialData: FirebaseAuth.instance.currentUser,
+                  builder: (context, snapshot) {
+                    final user = snapshot.data;
+                    if (user == null || user.isAnonymous) {
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: () =>
+                                _handleAuthAction(context, user: user),
+                            icon: Icon(_accountActionIcon(user)),
+                            label: Text(_accountActionLabel(user)),
+                          ),
+                          const SizedBox(height: 8),
+                          FilledButton(
+                            onPressed: () => _startCreateAccountFlow(context),
+                            child: const Text('Create account'),
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton(
+                            onPressed: () => _startSignInFlow(context),
+                            child: const Text('Sign in'),
+                          ),
+                        ],
+                      );
+                    }
+
+                    return OutlinedButton.icon(
+                      onPressed: () => _handleAuthAction(context, user: user),
+                      icon: Icon(_accountActionIcon(user)),
+                      label: Text(_accountActionLabel(user)),
+                    );
+                  },
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 18),
+
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(22),
+                gradient: LinearGradient(
+                  colors: [
+                    Colors.white.withOpacity(0.06),
+                    Colors.white.withOpacity(0.02),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                border: Border.all(color: Colors.white.withOpacity(0.08)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Your collector dashboard',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.92),
+                      fontSize: 18,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Scan cards, fill your Pokédex, and build complete sets one card at a time.',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.78),
+                      height: 1.35,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 18),
+
+            FutureBuilder<FeaturedCardData?>(
+              future: _future,
+              builder: (context, snap) {
+                if (snap.connectionState != ConnectionState.done) {
+                  return Container(
+                    height: 180,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      color: Colors.white.withOpacity(0.05),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                  );
+                }
+
+                if (snap.hasError) {
+                  return Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(24),
+                      color: Colors.white.withOpacity(0.05),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.cloud_off, color: Colors.white70),
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Text(
+                            'Card of the Day unavailable.',
+                            style: TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.refresh),
+                          onPressed: _reloadFeatured,
+                        ),
+                      ],
+                    ),
+                  );
+                }
+
+                final featured = snap.data;
+                if (featured == null) return const SizedBox.shrink();
+
+                return _FeaturedHeroCard(featured: featured);
+              },
+            ),
+
+            const SizedBox(height: 18),
+
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(24),
+                gradient: LinearGradient(
+                  colors: [
+                    Colors.black.withOpacity(0.28),
+                    Colors.black.withOpacity(0.16),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                border: Border.all(color: Colors.white.withOpacity(0.08)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.18),
+                    blurRadius: 18,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        'Collector status',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.92),
+                          fontSize: 18,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.08),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          'Level $level',
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      Expanded(child: _bigStat('Level', '$level')),
+                      Expanded(child: _bigStat('Streak', '$streak')),
+                      Expanded(child: _bigStat('Cards', '$cards')),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 18),
+
+            Row(
+              children: [
+                Expanded(
+                  child: _ActionPanelButton(
+                    icon: Icons.camera_alt_outlined,
+                    title: 'Scan your card',
+                    subtitle: 'Fast camera scan',
+                    filled: true,
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => ScanScreen(cameras: widget.cameras),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ActionPanelButton(
+                    icon: Icons.search,
+                    title: 'Search manually',
+                    subtitle: 'Find by name/set',
+                    filled: false,
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const ManualSearchScreen(),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 16),
+
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.05),
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(color: Colors.white.withOpacity(0.06)),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    Icons.lightbulb_outline,
+                    color: Colors.amber.shade300,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Tip: Manual search works best when scanning is blurry or the set/number is missing.',
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.78),
+                        height: 1.35,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _bigStat(String label, String value) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 4),
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.04),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(0.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(fontSize: 12, color: Colors.white70),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FeaturedHeroCard extends StatelessWidget {
+  final FeaturedCardData featured;
+  const _FeaturedHeroCard({required this.featured});
+
+  bool _isHttpUrl(String s) {
+    final u = s.trim();
+    return u.startsWith('http://') || u.startsWith('https://');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = featured.card;
+    final img = c.imageSmall.isNotEmpty ? c.imageSmall : c.imageLarge;
+    final hasImg = _isHttpUrl(img);
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(24),
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => CardOfTheDayScreen(featured: featured),
+          ),
+        );
+      },
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(24),
+          gradient: LinearGradient(
+            colors: [const Color(0xFF050816), const Color(0xFF0A0F2A)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          border: Border.all(color: Colors.white.withOpacity(0.08)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.28),
+              blurRadius: 24,
+              offset: const Offset(0, 12),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: SizedBox(
+                width: 110,
+                height: 150,
+                child: hasImg
+                    ? Image.network(
+                        img,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => _fallbackCardArt(),
+                      )
+                    : _fallbackCardArt(),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: Colors.white.withOpacity(0.10)),
+                    ),
+                    child: const Text(
+                      'CARD OF THE DAY',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1.0,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    c.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '${c.setName} - #${c.number}',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.74),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.local_fire_department,
+                        size: 16,
+                        color: Colors.orangeAccent,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          featured.meta.headline,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 6),
+            const Icon(Icons.chevron_right, color: Colors.white70),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _fallbackCardArt() {
+    return Container(
+      color: Colors.white.withOpacity(0.06),
+      child: const Center(child: Icon(Icons.image_not_supported_outlined)),
+    );
+  }
+}
+
+class _ActionPanelButton extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final bool filled;
+  final VoidCallback onTap;
+
+  const _ActionPanelButton({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.filled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = filled
+        ? Colors.white.withOpacity(0.08)
+        : Colors.white.withOpacity(0.03);
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(22),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: Colors.white.withOpacity(0.10)),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, size: 26),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              subtitle,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.68),
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class CardOfTheDayScreen extends StatelessWidget {
+  final FeaturedCardData featured;
+  const CardOfTheDayScreen({super.key, required this.featured});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = featured.card;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Card of the Day')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(24),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.white.withOpacity(0.06),
+                  Colors.white.withOpacity(0.02),
+                ],
+              ),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.30),
+                  blurRadius: 24,
+                  offset: const Offset(0, 14),
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 360),
+                      child: AspectRatio(
+                        aspectRatio: 63 / 88,
+                        child: PokemonCardShowcase(card: c, animate: true),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 18),
+
+                  Text(
+                    c.name,
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '${c.setName} - #${c.number}',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.72),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: Colors.white.withOpacity(0.10)),
+                    ),
+                    child: Text(
+                      featured.meta.headline,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.2,
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 14),
+
+                  Text(
+                    featured.meta.why,
+                    style: TextStyle(
+                      height: 1.45,
+                      color: Colors.white.withOpacity(0.88),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.06),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
+            ),
+            child: Text(
+              'Card of the Day highlights iconic, trending, or historically significant cards in Pokémon collecting.',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.78),
+                fontWeight: FontWeight.w600,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _imgFallbackLarge() {
+    return Container(
+      color: Colors.white.withOpacity(0.06),
+      child: const Center(
+        child: Icon(
+          Icons.image_not_supported_outlined,
+          size: 40,
+          color: Colors.white54,
+        ),
+      ),
+    );
+  }
+}
 /* --------------------------- SCAN FLOW (camera) --------------------------- */
 
 class ScanScreen extends StatefulWidget {
@@ -491,8 +3968,6 @@ class ManualSearchScreen extends StatefulWidget {
 }
 
 class _ManualSearchScreenState extends State<ManualSearchScreen> {
-  CardType _type = CardType.pokemon;
-
   final _nameController = TextEditingController();
   final _setController = TextEditingController();
   final _numberController = TextEditingController();
@@ -510,9 +3985,16 @@ class _ManualSearchScreenState extends State<ManualSearchScreen> {
     final set = _setController.text.trim();
     final number = _numberController.text.trim();
 
+    // ignore: avoid_print
+    print(
+      'TRACE manual_search.submit name="$name" set="${set.isEmpty ? '' : set}" number="${number.isEmpty ? '' : number}"',
+    );
+
     if (name.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter a name/player/Pokémon to search.')),
+        const SnackBar(
+          content: Text('Enter a Pokémon or card name to search.'),
+        ),
       );
       return;
     }
@@ -520,12 +4002,18 @@ class _ManualSearchScreenState extends State<ManualSearchScreen> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => SearchResultsScreen(
-          type: _type,
-          name: name,
-          set: set.isEmpty ? null : set,
-          number: number.isEmpty ? null : number,
-        ),
+        builder: (_) {
+          // ignore: avoid_print
+          print(
+            'TRACE manual_search.navigate_to_results name="$name" set="${set.isEmpty ? '' : set}" number="${number.isEmpty ? '' : number}"',
+          );
+          return SearchResultsScreen(
+            name: name,
+            set: set.isEmpty ? null : set,
+            number: number.isEmpty ? null : number,
+            browseOnly: true,
+          );
+        },
       ),
     );
   }
@@ -537,63 +4025,87 @@ class _ManualSearchScreenState extends State<ManualSearchScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const Text(
-            'Search basics',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 12),
-          DropdownButtonFormField<CardType>(
-            value: _type,
-            decoration: const InputDecoration(
-              labelText: 'Card type',
-              border: OutlineInputBorder(),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
             ),
-            items: CardType.values
-                .map((t) => DropdownMenuItem(value: t, child: Text(t.label)))
-                .toList(),
-            onChanged: (val) => setState(() => _type = val ?? CardType.pokemon),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Look up any Pokémon card',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Search by name, then optionally narrow by set or card number.',
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.72),
+                    height: 1.35,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 12),
+
+          const SizedBox(height: 16),
+
           TextField(
             controller: _nameController,
             textInputAction: TextInputAction.search,
             decoration: const InputDecoration(
-              labelText: 'Name / Player / Pokémon',
-              border: OutlineInputBorder(),
-              hintText: 'e.g., Charizard or Patrick Mahomes',
+              labelText: 'Pokémon / card name',
+              hintText: 'e.g. Charizard, Giratina VSTAR, Pikachu',
+              prefixIcon: Icon(Icons.search),
             ),
             onSubmitted: (_) => _search(),
           ),
-          const SizedBox(height: 18),
-          const Text(
-            'Optional filters',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-          ),
-          const SizedBox(height: 10),
+
+          const SizedBox(height: 12),
+
           TextField(
             controller: _setController,
             decoration: const InputDecoration(
               labelText: 'Set (optional)',
-              border: OutlineInputBorder(),
-              hintText: 'e.g., Base Set, Prizm, Topps Chrome',
+              hintText: 'e.g. Base, 151, Lost Origin',
+              prefixIcon: Icon(Icons.collections_bookmark_outlined),
             ),
           ),
+
           const SizedBox(height: 12),
+
           TextField(
             controller: _numberController,
             decoration: const InputDecoration(
               labelText: 'Card number (optional)',
-              border: OutlineInputBorder(),
-              hintText: 'e.g., 4/102 or #210',
+              hintText: 'e.g. 4, 183, 131',
+              prefixIcon: Icon(Icons.pin_outlined),
             ),
           ),
-          const SizedBox(height: 16),
+
+          const SizedBox(height: 18),
+
           SizedBox(
-            height: 52,
+            height: 54,
             child: ElevatedButton.icon(
               onPressed: _search,
               icon: const Icon(Icons.search),
-              label: const Text('Search'),
+              label: const Text('Search cards'),
+            ),
+          ),
+
+          const SizedBox(height: 14),
+
+          Text(
+            'Note: Manual Search is for browsing cards. Add to collection should happen through scanning.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.68),
+              fontWeight: FontWeight.w600,
             ),
           ),
         ],
@@ -661,21 +4173,21 @@ class _EmptyFallbackPanel extends StatelessWidget {
 /* ---------------------------- SEARCH RESULTS ---------------------------- */
 
 class SearchResultsScreen extends StatefulWidget {
-  final CardType type;
   final String name;
   final String? set;
   final String? number;
-
-  // prefetched from scanner (worker candidates)
   final List<PokemonCardResult>? prefetched;
+  final bool browseOnly;
+  final bool scannerFallback;
 
   const SearchResultsScreen({
     super.key,
-    required this.type,
     required this.name,
     this.set,
     this.number,
     this.prefetched,
+    this.browseOnly = false,
+    this.scannerFallback = false,
   });
 
   @override
@@ -687,10 +4199,16 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
   bool _updating = false;
   String? _error;
   List<PokemonCardResult> _results = const [];
+  bool _loggedFirstResultsRender = false;
+  bool _loggedEmptyStateRender = false;
 
   @override
   void initState() {
     super.initState();
+    // ignore: avoid_print
+    print(
+      'TRACE results_screen.init name="${widget.name}" set="${widget.set ?? ''}" number="${widget.number ?? ''}" prefetched=${widget.prefetched?.length ?? 0}',
+    );
 
     final pre = widget.prefetched;
     if (pre != null && pre.isNotEmpty) {
@@ -699,7 +4217,6 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
       _updating = false;
       _error = null;
 
-      // If scanner only found one, auto-open details.
       if (pre.length == 1) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
@@ -707,7 +4224,11 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
           Navigator.pushReplacement(
             context,
             MaterialPageRoute(
-              builder: (_) => PokemonCardDetailsScreen(card: c),
+              builder: (_) => PokemonCardDetailsScreen(
+                card: c,
+                compactAddMode: widget.scannerFallback,
+                readOnly: widget.scannerFallback ? false : widget.browseOnly,
+              ),
             ),
           );
         });
@@ -718,22 +4239,30 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
   }
 
   Future<void> _load() async {
+    // ignore: avoid_print
+    print(
+      'TRACE results_screen.load.start name="${widget.name}" set="${widget.set ?? ''}" number="${widget.number ?? ''}"',
+    );
     setState(() {
       _loading = true;
       _updating = false;
       _error = null;
+      _loggedFirstResultsRender = false;
+      _loggedEmptyStateRender = false;
     });
 
     final api = PokemonTcgApi();
 
-    // cached first
     try {
       final cached = await api.getCachedSearch(
         name: widget.name,
         set: widget.set,
         number: widget.number,
       );
+      // ignore: avoid_print
+      print('TRACE results_screen.load.cached_return count=${cached.length}');
       if (!mounted) return;
+
       if (cached.isNotEmpty) {
         setState(() {
           _results = cached;
@@ -741,24 +4270,36 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
           _updating = true;
         });
       }
-    } catch (_) {}
+    } catch (e) {
+      // ignore: avoid_print
+      print('TRACE results_screen.load.cached_error error=$e');
+    }
 
-    // live refresh
     try {
       final live = await api.refreshSearch(
         name: widget.name,
         set: widget.set,
         number: widget.number,
       );
+      // ignore: avoid_print
+      print('TRACE results_screen.load.live_return count=${live.length}');
       if (!mounted) return;
+
       setState(() {
         _results = live;
         _loading = false;
         _updating = false;
         _error = live.isEmpty ? 'No results found.' : null;
       });
-    } catch (_) {
+      // ignore: avoid_print
+      print(
+        'TRACE results_screen.load.state_updated loading=$_loading updating=$_updating error="${_error ?? ''}" results=${_results.length}',
+      );
+    } catch (e) {
+      // ignore: avoid_print
+      print('TRACE results_screen.load.live_error error=$e');
       if (!mounted) return;
+
       setState(() {
         _loading = false;
         _updating = false;
@@ -766,28 +4307,46 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
           _error = 'Live results are unavailable right now. Please try again.';
         }
       });
+      // ignore: avoid_print
+      print(
+        'TRACE results_screen.load.error_state_updated loading=$_loading updating=$_updating error="${_error ?? ''}" results=${_results.length}',
+      );
     }
+  }
+
+  Widget _imageFallback() {
+    return Container(
+      color: Colors.white.withOpacity(0.05),
+      child: const Center(
+        child: Icon(Icons.image_not_supported_outlined, color: Colors.white54),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (widget.type == CardType.sports) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Results')),
-        body: const Center(
-          child: Text(
-            'Sports results coming next.\n\nWe’ll likely use eBay sold listings or a paid data provider.',
-            textAlign: TextAlign.center,
-          ),
-        ),
+    final results = _results;
+
+    if (!_loading && results.isNotEmpty && !_loggedFirstResultsRender) {
+      _loggedFirstResultsRender = true;
+      // ignore: avoid_print
+      print(
+        'TRACE results_screen.render.results count=${results.length} first="${results.first.name}"',
       );
     }
 
-    final results = _results;
+    if (!_loading &&
+        _error != null &&
+        results.isEmpty &&
+        !_loggedEmptyStateRender) {
+      _loggedEmptyStateRender = true;
+      // ignore: avoid_print
+      print('TRACE results_screen.render.empty error="$_error"');
+    }
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Results'),
+        title: Text(widget.browseOnly ? 'Browse Cards' : 'Results'),
         actions: [
           IconButton(
             tooltip: 'Retry',
@@ -809,7 +4368,7 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
                     children: [
                       CircularProgressIndicator(),
                       SizedBox(height: 12),
-                      Text('Searching…', textAlign: TextAlign.center),
+                      Text('Searching...', textAlign: TextAlign.center),
                     ],
                   ),
                 ),
@@ -817,10 +4376,17 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
             )
           else if (_error != null && results.isEmpty)
             Expanded(
-              child: _EmptyFallbackPanel(
-                query: '${widget.name} ${widget.number ?? ''}'.trim(),
-                onRetry: _load,
-              ),
+              child: _error == 'No results found.'
+                  ? Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(18),
+                        child: Text(_error!, textAlign: TextAlign.center),
+                      ),
+                    )
+                  : _EmptyFallbackPanel(
+                      query: '${widget.name} ${widget.number ?? ''}'.trim(),
+                      onRetry: _load,
+                    ),
             )
           else
             Expanded(
@@ -830,48 +4396,155 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
                 separatorBuilder: (_, __) => const SizedBox(height: 10),
                 itemBuilder: (context, i) {
                   final c = results[i];
-                  final saved = collectionStore.containsCardId(c.id);
+                  final img = c.imageSmall.isNotEmpty
+                      ? c.imageSmall
+                      : c.imageLarge;
+                  final hasImg =
+                      img.startsWith('http://') || img.startsWith('https://');
 
-                  // ✅ IMPORTANT: Search results thumbnails are ALWAYS FULL COLOR.
-                  // (Greyscale is only for Pokédex/missing slots.)
-                  return Card(
-                    child: ListTile(
-                      leading: c.imageSmall.isEmpty
-                          ? const Icon(Icons.image_not_supported)
-                          : ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.network(
-                                c.imageSmall,
-                                width: 56,
-                                height: 56,
-                                fit: BoxFit.cover,
+                  return InkWell(
+                    borderRadius: BorderRadius.circular(24),
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => PokemonCardDetailsScreen(
+                            card: c,
+                            compactAddMode: widget.scannerFallback,
+                            readOnly: widget.scannerFallback
+                                ? false
+                                : widget.browseOnly,
+                          ),
+                        ),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(24),
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Colors.white.withOpacity(0.06),
+                            Colors.white.withOpacity(0.025),
+                          ],
+                        ),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.08),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.18),
+                            blurRadius: 16,
+                            offset: const Offset(0, 10),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(16),
+                            child: SizedBox(
+                              width: 82,
+                              height: 114,
+                              child: hasImg
+                                  ? Image.network(
+                                      img,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (_, __, ___) => Container(
+                                        color: Colors.white.withOpacity(0.05),
+                                        child: const Center(
+                                          child: Icon(
+                                            Icons.image_not_supported_outlined,
+                                            color: Colors.white54,
+                                          ),
+                                        ),
+                                      ),
+                                    )
+                                  : Container(
+                                      color: Colors.white.withOpacity(0.05),
+                                      child: const Center(
+                                        child: Icon(
+                                          Icons.image_not_supported_outlined,
+                                          color: Colors.white54,
+                                        ),
+                                      ),
+                                    ),
+                            ),
+                          ),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.only(top: 2),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    c.name,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 17,
+                                      fontWeight: FontWeight.w900,
+                                      height: 1.15,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    c.setName,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: Colors.white.withOpacity(0.76),
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 15,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '#${c.number}',
+                                    style: TextStyle(
+                                      color: Colors.white.withOpacity(0.62),
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                      vertical: 7,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white.withOpacity(0.06),
+                                      borderRadius: BorderRadius.circular(999),
+                                    ),
+                                    child: Text(
+                                      widget.browseOnly
+                                          ? 'View card details'
+                                          : 'Tap to inspect',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w800,
+                                        color: Colors.white70,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                      title: Text('${c.name} • ${c.setName}'),
-                      subtitle: Text('#${c.number}\nTap for details'),
-                      isThreeLine: true,
-                      trailing: IconButton(
-                        icon: Icon(
-                          saved ? Icons.check_circle : Icons.add_circle,
-                        ),
-                        onPressed: () async {
-                          final already = collectionStore.containsCardId(c.id);
-                          if (already) return;
-
-                          collectionStore.addCard(c);
-                          setState(() {});
-
-                          await showPokedexRegistered(context, card: c);
-                        },
-                      ),
-                      onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) => PokemonCardDetailsScreen(card: c),
                           ),
-                        );
-                      },
+                          const SizedBox(width: 8),
+                          Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Icon(
+                              Icons.chevron_right,
+                              color: Colors.white.withOpacity(0.72),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   );
                 },
@@ -896,26 +4569,100 @@ class CollectionScreen extends StatefulWidget {
 
 class _CollectionScreenState extends State<CollectionScreen> {
   final _searchCtrl = TextEditingController();
+  Timer? _searchDebounce;
   String _query = '';
+  List<SetSummary> _allSets = const <SetSummary>[];
+  List<_CollectionSearchHit> _searchHits = const <_CollectionSearchHit>[];
+  List<_OwnedSearchCandidate> _searchSource = const <_OwnedSearchCandidate>[];
 
   @override
   void initState() {
     super.initState();
-    collectionStore.addListener(_onChanged);
-    _searchCtrl.addListener(() {
-      setState(() => _query = _searchCtrl.text.trim().toLowerCase());
-    });
+    _allSets = collectionStore.getSetSummariesView();
+    _searchSource = _buildOwnedSearchSource(_allSets);
+    collectionStore.collectionViewVersion.addListener(_onCollectionChanged);
+    _searchCtrl.addListener(_onSearchChanged);
   }
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
+    _searchCtrl.removeListener(_onSearchChanged);
     _searchCtrl.dispose();
-    collectionStore.removeListener(_onChanged);
+    collectionStore.collectionViewVersion.removeListener(_onCollectionChanged);
     super.dispose();
   }
 
-  void _onChanged() {
-    if (mounted) setState(() {});
+  void _onCollectionChanged() {
+    final summaries = collectionStore.getSetSummariesView();
+    final source = _buildOwnedSearchSource(summaries);
+    final nextHits = _query.isEmpty
+        ? const <_CollectionSearchHit>[]
+        : _buildCollectionSearchHits(source, _query);
+    if (!mounted) return;
+    setState(() {
+      _allSets = summaries;
+      _searchSource = source;
+      _searchHits = nextHits;
+    });
+  }
+
+  void _onSearchChanged() {
+    final nextQuery = _searchCtrl.text.trim().toLowerCase();
+    if (nextQuery == _query) return;
+
+    _searchDebounce?.cancel();
+
+    if (nextQuery.isEmpty) {
+      setState(() {
+        _query = '';
+        _searchHits = const <_CollectionSearchHit>[];
+      });
+      return;
+    }
+
+    setState(() => _query = nextQuery);
+
+    _searchDebounce = Timer(const Duration(milliseconds: 60), () {
+      final hits = _buildCollectionSearchHits(_searchSource, nextQuery);
+      if (!mounted || nextQuery != _query) return;
+      setState(() => _searchHits = hits);
+    });
+  }
+
+  List<_OwnedSearchCandidate> _buildOwnedSearchSource(
+    List<SetSummary> summaries,
+  ) {
+    final source = <_OwnedSearchCandidate>[];
+
+    for (final summary in summaries) {
+      final ownedMap = collectionStore.ownedSlotMapViewForSet(summary.setKey);
+
+      for (final entry in ownedMap.entries) {
+        final slot = entry.key;
+        final owned = entry.value;
+        final name = owned.name.trim();
+        if (name.isEmpty) continue;
+
+        final hit = _CollectionSearchHit(
+          setKey: summary.setKey,
+          setName: summary.setName,
+          printedTotal: summary.printedTotal,
+          slot: slot,
+          ownedCard: owned,
+        );
+
+        source.add(
+          _OwnedSearchCandidate(
+            haystack: '${owned.name} ${summary.setName} ${owned.number} $slot'
+                .toLowerCase(),
+            hit: hit,
+          ),
+        );
+      }
+    }
+
+    return source;
   }
 
   List<SetSummary> _filteredSets(List<SetSummary> sets) {
@@ -926,9 +4673,131 @@ class _CollectionScreenState extends State<CollectionScreen> {
     }).toList();
   }
 
+  List<_CollectionSearchHit> _buildCollectionSearchHits(
+    List<_OwnedSearchCandidate> source,
+    String query,
+  ) {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return const <_CollectionSearchHit>[];
+
+    final hits = <_CollectionSearchHit>[];
+
+    for (final candidate in source) {
+      if (!candidate.haystack.contains(q)) continue;
+      hits.add(candidate.hit);
+    }
+
+    hits.sort((a, b) {
+      final aName = a.displayName.toLowerCase();
+      final bName = b.displayName.toLowerCase();
+      final aPrefix = aName.startsWith(q) ? 0 : 1;
+      final bPrefix = bName.startsWith(q) ? 0 : 1;
+      if (aPrefix != bPrefix) return aPrefix.compareTo(bPrefix);
+      final byName = aName.compareTo(bName);
+      if (byName != 0) return byName;
+      final bySet = a.setName.toLowerCase().compareTo(b.setName.toLowerCase());
+      if (bySet != 0) return bySet;
+      return a.slot.compareTo(b.slot);
+    });
+
+    return hits;
+  }
+
+  void _openCollectionSearchHit(_CollectionSearchHit hit) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        settings: const RouteSettings(name: 'set_pokedex'),
+        builder: (_) => SetPokedexScreen(
+          setKey: hit.setKey,
+          setName: hit.setName,
+          printedTotal: hit.printedTotal,
+          initialSlot: hit.slot,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCardSearchResults(List<_CollectionSearchHit> hits) {
+    if (hits.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.search_off_rounded,
+                size: 42,
+                color: Colors.white.withOpacity(0.5),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'No cards match this search.',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Try a card name like Charizard or Pikachu.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  height: 1.4,
+                  color: Colors.white.withOpacity(0.72),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final crossAxisCount = width >= 860
+            ? 5
+            : width >= 640
+            ? 4
+            : 3;
+        final cacheExtent = (constraints.maxHeight * 0.5).clamp(240.0, 640.0);
+
+        return GridView.builder(
+          cacheExtent: cacheExtent,
+          addAutomaticKeepAlives: false,
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            mainAxisSpacing: 14,
+            crossAxisSpacing: 12,
+            childAspectRatio: 0.57,
+          ),
+          itemCount: hits.length,
+          itemBuilder: (context, index) {
+            final hit = hits[index];
+            return _CollectionSearchResultTile(
+              hit: hit,
+              onTap: () => _openCollectionSearchHit(hit),
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final sets = _filteredSets(collectionStore.getSetSummaries());
+    final allSets = _allSets;
+    final hasCollectionContent =
+        allSets.isNotEmpty || collectionStore.count > 0;
+    final sets = _filteredSets(allSets);
+    final totalCards = collectionStore.count;
+    final completedSets = allSets
+        .where(
+          (s) =>
+              s.printedTotal != null && s.printedTotal! > 0 && s.progress >= 1,
+        )
+        .length;
+    final searchHits = _searchHits;
 
     return Scaffold(
       appBar: AppBar(
@@ -936,135 +4805,758 @@ class _CollectionScreenState extends State<CollectionScreen> {
         actions: [
           IconButton(
             tooltip: 'Clear (testing)',
-            onPressed: collectionStore.count == 0
+            onPressed: !hasCollectionContent
                 ? null
                 : () => collectionStore.clear(),
             icon: const Icon(Icons.delete_outline),
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-            child: TextField(
-              controller: _searchCtrl,
-              decoration: InputDecoration(
-                hintText: 'Search sets...',
-                prefixIcon: const Icon(Icons.search),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.close),
-                        onPressed: () => _searchCtrl.clear(),
-                      ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-            ),
-          ),
-          if (collectionStore.count == 0)
-            const Expanded(
-              child: Center(
-                child: Text(
-                  'No cards saved yet.\nScan a card to start your first set.',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            )
-          else
-            Expanded(
-              child: ListView.separated(
-                padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                itemCount: sets.length,
-                separatorBuilder: (_, __) => const SizedBox(height: 10),
-                itemBuilder: (context, i) {
-                  final s = sets[i];
-                  final total = s.printedTotal ?? 0;
-                  final progressText = (total > 0)
-                      ? '${s.ownedUniqueSlots} / $total'
-                      : '${s.ownedInstances} cards';
-
-                  return Card(
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(12),
-                      onTap: () {
-                        Navigator.push(
-                          context,
-                          MaterialPageRoute(
-                            settings: const RouteSettings(name: 'set_pokedex'),
-                            builder: (_) => SetPokedexScreen(
-                              setKey: s.setKey,
-                              setName: s.setName,
-                              printedTotal: s.printedTotal,
-                            ),
-                          ),
-                        );
-                      },
-                      child: Padding(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    s.setName,
-                                    style: const TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ),
-                                const Icon(Icons.chevron_right),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            Row(
-                              children: [
-                                Text(
-                                  progressText,
-                                  style: const TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: ClipRRect(
-                                    borderRadius: BorderRadius.circular(99),
-                                    child: LinearProgressIndicator(
-                                      value:
-                                          (s.printedTotal == null ||
-                                              s.printedTotal == 0)
-                                          ? null
-                                          : s.progress,
-                                      minHeight: 10,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              (s.printedTotal == null || s.printedTotal == 0)
-                                  ? 'Tap to view your cards'
-                                  : 'Tap to fill your Pokédex',
-                              style: TextStyle(
-                                color: Theme.of(
-                                  context,
-                                ).colorScheme.onSurface.withOpacity(0.7),
+      body: hasCollectionContent
+          ? Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+                  child: _CollectionLandingHeader(
+                    totalSets: allSets.length,
+                    totalCards: totalCards,
+                    completedSets: completedSets,
+                    searchField: TextField(
+                      controller: _searchCtrl,
+                      decoration: InputDecoration(
+                        hintText: 'Search cards or sets...',
+                        prefixIcon: const Icon(Icons.search),
+                        suffixIcon: _query.isEmpty
+                            ? null
+                            : IconButton(
+                                icon: const Icon(Icons.close),
+                                onPressed: () => _searchCtrl.clear(),
                               ),
-                            ),
-                          ],
+                        filled: true,
+                        fillColor: Colors.white.withOpacity(0.06),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(18),
+                          borderSide: BorderSide(
+                            color: Colors.white.withOpacity(0.08),
+                          ),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(18),
+                          borderSide: BorderSide(
+                            color: Colors.white.withOpacity(0.08),
+                          ),
                         ),
                       ),
                     ),
-                  );
-                },
+                  ),
+                ),
+                Expanded(
+                  child: _query.isEmpty
+                      ? ListView.separated(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+                          itemCount: sets.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 14),
+                          itemBuilder: (context, i) {
+                            final s = sets[i];
+                            return _CollectionSetTile(
+                              summary: s,
+                              onTap: () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    settings: const RouteSettings(
+                                      name: 'set_pokedex',
+                                    ),
+                                    builder: (_) => SetPokedexScreen(
+                                      setKey: s.setKey,
+                                      setName: s.setName,
+                                      printedTotal: s.printedTotal,
+                                    ),
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        )
+                      : _buildCardSearchResults(searchHits),
+                ),
+              ],
+            )
+          : const _PreCollectionState(),
+    );
+  }
+}
+
+class _CollectionLandingHeader extends StatelessWidget {
+  final int totalSets;
+  final int totalCards;
+  final int completedSets;
+  final Widget searchField;
+
+  const _CollectionLandingHeader({
+    required this.totalSets,
+    required this.totalCards,
+    required this.completedSets,
+    required this.searchField,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(26),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF13203B), Color(0xFF0B1020)],
+        ),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.18),
+            blurRadius: 24,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'COLLECTOR VAULT',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 1.4,
+              color: Colors.white.withOpacity(0.74),
+            ),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            'Your sets, progress, and missing slots in one place.',
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w900,
+              height: 1.15,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Open a set to fill your Pokédex and turn grayscale gaps into collected cards.',
+            style: TextStyle(
+              height: 1.45,
+              fontWeight: FontWeight.w600,
+              color: Colors.white.withOpacity(0.76),
+            ),
+          ),
+          const SizedBox(height: 18),
+          Row(
+            children: [
+              Expanded(
+                child: _CollectionStatPill(
+                  label: 'Sets',
+                  value: '$totalSets',
+                  icon: Icons.auto_awesome_mosaic_outlined,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _CollectionStatPill(
+                  label: 'Cards',
+                  value: '$totalCards',
+                  icon: Icons.style_outlined,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _CollectionStatPill(
+                  label: 'Complete',
+                  value: '$completedSets',
+                  icon: Icons.workspace_premium_outlined,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          searchField,
+        ],
+      ),
+    );
+  }
+}
+
+class _CollectionStatPill extends StatelessWidget {
+  final String label;
+  final String value;
+  final IconData icon;
+
+  const _CollectionStatPill({
+    required this.label,
+    required this.value,
+    required this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: Colors.white.withOpacity(0.84)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  value,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white.withOpacity(0.7),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CollectionSetTile extends StatelessWidget {
+  final SetSummary summary;
+  final VoidCallback onTap;
+
+  const _CollectionSetTile({required this.summary, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final total = summary.printedTotal ?? 0;
+    final percent = (summary.progress * 100).round();
+    final missingCount = total > 0 ? (total - summary.ownedUniqueSlots) : 0;
+    final progressText = total > 0
+        ? '${summary.ownedUniqueSlots} / $total'
+        : '${summary.ownedInstances} cards';
+    final subtitle = total > 0
+        ? '$percent% complete - $missingCount locked'
+        : 'cards captured';
+    final footer = total > 0
+        ? 'Tap to fill your Pokédex'
+        : 'Tap to view your cards';
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: onTap,
+        child: Ink(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(24),
+            gradient: const LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF162847), Color(0xFF0D1426)],
+            ),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.2),
+                blurRadius: 20,
+                offset: const Offset(0, 10),
+              ),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'SET PROGRESS',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 1.2,
+                              color: Colors.white.withOpacity(0.66),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            summary.setName,
+                            style: const TextStyle(
+                              fontSize: 24,
+                              fontWeight: FontWeight.w900,
+                              height: 1.05,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            progressText,
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            subtitle,
+                            style: TextStyle(
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white.withOpacity(0.8),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.08),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.08),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          Text(
+                            total > 0
+                                ? '$percent%'
+                                : '${summary.ownedInstances}',
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            total > 0 ? 'complete' : 'cards',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white.withOpacity(0.68),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(999),
+                  child: LinearProgressIndicator(
+                    value:
+                        (summary.printedTotal == null ||
+                            summary.printedTotal == 0)
+                        ? null
+                        : summary.progress,
+                    minHeight: 14,
+                    backgroundColor: Colors.white.withOpacity(0.08),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.06),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.08),
+                        ),
+                      ),
+                      child: Text(
+                        footer,
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white.withOpacity(0.84),
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    const Icon(Icons.chevron_right_rounded, size: 28),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CollectionSearchHit {
+  final String setKey;
+  final String setName;
+  final int? printedTotal;
+  final int slot;
+  final PokemonCardResult ownedCard;
+
+  const _CollectionSearchHit({
+    required this.setKey,
+    required this.setName,
+    required this.printedTotal,
+    required this.slot,
+    required this.ownedCard,
+  });
+
+  String get displayName => ownedCard.name;
+}
+
+class _OwnedSearchCandidate {
+  final String haystack;
+  final _CollectionSearchHit hit;
+
+  const _OwnedSearchCandidate({required this.haystack, required this.hit});
+}
+
+class _CollectionSearchResultTile extends StatelessWidget {
+  final _CollectionSearchHit hit;
+  final VoidCallback onTap;
+
+  const _CollectionSearchResultTile({required this.hit, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return RepaintBoundary(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: _OwnedSlotTile(
+              slot: hit.slot,
+              card: hit.ownedCard,
+              onTap: onTap,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            hit.setName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.74),
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PreCollectionState extends StatelessWidget {
+  const _PreCollectionState();
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 560),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const _PreCollectionHero(),
+                const SizedBox(height: 28),
+                Text(
+                  'Unlock Your Collection',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  'Scan your first real card to open your binder, reveal set progress, and start filling missing slots.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    height: 1.45,
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withOpacity(0.78),
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  alignment: WrapAlignment.center,
+                  children: const [
+                    _CollectionPromiseChip(
+                      icon: Icons.collections_bookmark_outlined,
+                      label: 'Track real sets',
+                    ),
+                    _CollectionPromiseChip(
+                      icon: Icons.auto_awesome_outlined,
+                      label: 'Reveal missing cards',
+                    ),
+                    _CollectionPromiseChip(
+                      icon: Icons.workspace_premium_outlined,
+                      label: 'Build binder progress',
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 28),
+                SizedBox(
+                  width: double.infinity,
+                  height: 56,
+                  child: ElevatedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => ScanScreen(cameras: gCameras),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.camera_alt_outlined),
+                    label: const Text('Scan your first card'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PreCollectionHero extends StatelessWidget {
+  const _PreCollectionHero();
+
+  @override
+  Widget build(BuildContext context) {
+    return AspectRatio(
+      aspectRatio: 1.08,
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(28),
+          gradient: const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF13203B), Color(0xFF0A0F1D)],
+          ),
+          border: Border.all(color: Colors.white.withOpacity(0.08)),
+        ),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(28),
+                  gradient: RadialGradient(
+                    center: const Alignment(0, -0.25),
+                    radius: 0.95,
+                    colors: [
+                      Colors.white.withOpacity(0.11),
+                      Colors.transparent,
+                    ],
+                  ),
+                ),
               ),
             ),
+            Center(
+              child: SizedBox(
+                width: 250,
+                height: 250,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: const [
+                    _PreCollectionCard(angle: -0.22, dx: -64, dy: 18),
+                    _PreCollectionCard(angle: 0.18, dx: 64, dy: 18),
+                    _PreCollectionCard(angle: 0, dx: 0, dy: -8, locked: true),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PreCollectionCard extends StatelessWidget {
+  final double angle;
+  final double dx;
+  final double dy;
+  final bool locked;
+
+  const _PreCollectionCard({
+    required this.angle,
+    required this.dx,
+    required this.dy,
+    this.locked = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    Widget card = Container(
+      width: 126,
+      height: 176,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(18),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withOpacity(0.18),
+            Colors.white.withOpacity(0.06),
+          ],
+        ),
+        border: Border.all(color: Colors.white.withOpacity(0.12)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.22),
+            blurRadius: 18,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 44,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.18),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                  const Spacer(),
+                  Container(
+                    width: double.infinity,
+                    height: 68,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    width: 72,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.18),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (locked)
+            Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.48),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: Colors.white.withOpacity(0.14)),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.lock_outline, size: 16),
+                    SizedBox(width: 6),
+                    Text(
+                      'LOCKED',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1.1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+
+    card = ColorFiltered(
+      colorFilter: const ColorFilter.matrix(kGreyMatrix),
+      child: card,
+    );
+
+    return Transform.translate(
+      offset: Offset(dx, dy),
+      child: Transform.rotate(angle: angle, child: card),
+    );
+  }
+}
+
+class _CollectionPromiseChip extends StatelessWidget {
+  final IconData icon;
+  final String label;
+
+  const _CollectionPromiseChip({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16),
+          const SizedBox(width: 8),
+          Text(label, style: const TextStyle(fontWeight: FontWeight.w700)),
         ],
       ),
     );
@@ -1077,12 +5569,14 @@ class SetPokedexScreen extends StatefulWidget {
   final String setKey;
   final String setName;
   final int? printedTotal;
+  final int? initialSlot;
 
   const SetPokedexScreen({
     super.key,
     required this.setKey,
     required this.setName,
     required this.printedTotal,
+    this.initialSlot,
   });
 
   @override
@@ -1091,10 +5585,14 @@ class SetPokedexScreen extends StatefulWidget {
 
 class _SetPokedexScreenState extends State<SetPokedexScreen> {
   final _searchCtrl = TextEditingController();
+  final ScrollController _gridScrollCtrl = ScrollController();
   String _query = '';
 
   CollectedEvent? _celebrate;
   bool _showCelebrate = false;
+  int? _justUnlockedSlot;
+  int _slotHighlightToken = 0;
+  bool _didInitialSlotReveal = false;
 
   void _onCollectedEvent() {
     final e = collectionStore.lastCollected.value;
@@ -1106,6 +5604,8 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
       _showCelebrate = true;
     });
 
+    _flashSlotHighlight(e.slot, duration: const Duration(milliseconds: 1800));
+
     Future.delayed(const Duration(seconds: 4), () {
       if (!mounted) return;
       setState(() => _showCelebrate = false);
@@ -1116,7 +5616,8 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
   void initState() {
     super.initState();
 
-    collectionStore.addListener(_onChanged);
+    collectionStore.collectionViewVersion.addListener(_onChanged);
+    collectionStore.setIndexVersion.addListener(_onChanged);
     collectionStore.lastCollected.addListener(_onCollectedEvent);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1134,7 +5635,9 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
   @override
   void dispose() {
     _searchCtrl.dispose();
-    collectionStore.removeListener(_onChanged);
+    _gridScrollCtrl.dispose();
+    collectionStore.collectionViewVersion.removeListener(_onChanged);
+    collectionStore.setIndexVersion.removeListener(_onChanged);
     collectionStore.lastCollected.removeListener(_onCollectedEvent);
     super.dispose();
   }
@@ -1143,7 +5646,108 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
     if (mounted) setState(() {});
   }
 
+  void _flashSlotHighlight(int slot, {required Duration duration}) {
+    final token = ++_slotHighlightToken;
+    setState(() => _justUnlockedSlot = slot);
+
+    Future.delayed(duration, () {
+      if (!mounted) return;
+      if (_slotHighlightToken != token) return;
+      setState(() => _justUnlockedSlot = null);
+    });
+  }
+
+  void _maybeRevealInitialSlot({
+    required List<int> slots,
+    required int crossAxisCount,
+    required double maxWidth,
+  }) {
+    final targetSlot = widget.initialSlot;
+    if (targetSlot == null || _didInitialSlotReveal) return;
+
+    final targetIndex = slots.indexOf(targetSlot);
+    if (targetIndex < 0) return;
+    _didInitialSlotReveal = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+
+      final usableWidth = maxWidth - 32;
+      final childWidth =
+          (usableWidth - ((crossAxisCount - 1) * 12)) / crossAxisCount;
+      final childHeight = childWidth / 0.7;
+      final row = targetIndex ~/ crossAxisCount;
+      final targetOffset = row * (childHeight + 12);
+
+      if (_gridScrollCtrl.hasClients) {
+        final maxOffset = _gridScrollCtrl.position.maxScrollExtent;
+        _gridScrollCtrl.animateTo(
+          targetOffset.clamp(0.0, maxOffset),
+          duration: const Duration(milliseconds: 420),
+          curve: Curves.easeOutCubic,
+        );
+      }
+
+      _flashSlotHighlight(
+        targetSlot,
+        duration: const Duration(milliseconds: 2200),
+      );
+    });
+  }
+
+  void _maybeSeedInitialSlotFallback(bool showGrid) {
+    final targetSlot = widget.initialSlot;
+    if (showGrid ||
+        targetSlot == null ||
+        _didInitialSlotReveal ||
+        _query.isNotEmpty) {
+      return;
+    }
+
+    _didInitialSlotReveal = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _searchCtrl.text = '$targetSlot';
+      _flashSlotHighlight(
+        targetSlot,
+        duration: const Duration(milliseconds: 2200),
+      );
+    });
+  }
+
   int? _parseInt(String s) => int.tryParse(s);
+
+  List<int> _filteredSlots(
+    int total,
+    Map<int, PokemonCardResult> ownedMap,
+    Map<int, PreviewCard> previewMap,
+  ) {
+    final q = _query.trim().toLowerCase();
+    if (q.isEmpty) return List<int>.generate(total, (i) => i + 1);
+
+    final qNum = _parseInt(q);
+    if (qNum != null) {
+      return (qNum >= 1 && qNum <= total) ? <int>[qNum] : const <int>[];
+    }
+
+    final slots = <int>[];
+    for (var slot = 1; slot <= total; slot++) {
+      final owned = ownedMap[slot];
+      final preview = previewMap[slot];
+      final hay = owned != null
+          ? '${owned.name} ${owned.number}'.toLowerCase()
+          : '${preview?.name ?? ''} $slot'.toLowerCase();
+      if (hay.contains(q)) {
+        slots.add(slot);
+      }
+    }
+    return slots;
+  }
+
+  int _gridCrossAxisCount(double width) {
+    if (width >= 700) return 5;
+    return 4;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1164,6 +5768,11 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
     final progressTotal = widget.printedTotal ?? total;
     final ownedCount = collectionStore.registeredCountForSet(widget.setKey);
     final showGrid = total >= 10 && total <= 500;
+    _maybeSeedInitialSlotFallback(showGrid);
+    final progressValue = progressTotal == 0
+        ? 0.0
+        : (ownedCount / progressTotal).clamp(0.0, 1.0);
+    final progressPercent = (progressValue * 100).round();
 
     return Scaffold(
       appBar: AppBar(title: Text(widget.setName)),
@@ -1173,54 +5782,147 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
             children: [
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
-                child: TextField(
-                  controller: _searchCtrl,
-                  decoration: InputDecoration(
-                    hintText: showGrid
-                        ? 'Search # or card name...'
-                        : 'Search your cards...',
-                    prefixIcon: const Icon(Icons.search),
-                    suffixIcon: _query.isEmpty
-                        ? null
-                        : IconButton(
-                            icon: const Icon(Icons.close),
-                            onPressed: () => _searchCtrl.clear(),
-                          ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(24),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Color(0xFF14233F), Color(0xFF0B1222)],
                     ),
-                  ),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        showGrid
-                            ? 'Progress: $ownedCount / $progressTotal'
-                            : 'Cards in set: ${ownedMap.length}',
-                        style: const TextStyle(fontWeight: FontWeight.w700),
+                    border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.18),
+                        blurRadius: 20,
+                        offset: const Offset(0, 10),
                       ),
-                    ),
-                    if (showGrid)
-                      SizedBox(
-                        width: 140,
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(99),
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'SET VAULT',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: 1.2,
+                                    color: Colors.white.withOpacity(0.68),
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  widget.setName,
+                                  style: const TextStyle(
+                                    fontSize: 26,
+                                    fontWeight: FontWeight.w900,
+                                    height: 1.05,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  showGrid
+                                      ? '$ownedCount / $progressTotal collected - ${progressTotal - ownedCount} locked'
+                                      : '${ownedMap.length} cards in this set',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white.withOpacity(0.8),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          if (showGrid)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.08),
+                                borderRadius: BorderRadius.circular(18),
+                                border: Border.all(
+                                  color: Colors.white.withOpacity(0.08),
+                                ),
+                              ),
+                              child: Column(
+                                children: [
+                                  Text(
+                                    '$progressPercent%',
+                                    style: const TextStyle(
+                                      fontSize: 22,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'complete',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w800,
+                                      color: Colors.white.withOpacity(0.68),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
+                      if (showGrid) ...[
+                        const SizedBox(height: 14),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(999),
                           child: LinearProgressIndicator(
-                            value: progressTotal == 0
-                                ? 0
-                                : (ownedCount / progressTotal).clamp(0.0, 1.0),
-                            minHeight: 10,
+                            value: progressValue,
+                            minHeight: 12,
+                            backgroundColor: Colors.white.withOpacity(0.08),
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: _searchCtrl,
+                        decoration: InputDecoration(
+                          hintText: showGrid
+                              ? 'Filter by card name or slot number...'
+                              : 'Search your cards...',
+                          prefixIcon: const Icon(Icons.search),
+                          suffixIcon: _query.isEmpty
+                              ? null
+                              : IconButton(
+                                  icon: const Icon(Icons.close),
+                                  onPressed: () => _searchCtrl.clear(),
+                                ),
+                          filled: true,
+                          fillColor: Colors.white.withOpacity(0.06),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(18),
+                            borderSide: BorderSide(
+                              color: Colors.white.withOpacity(0.08),
+                            ),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(18),
+                            borderSide: BorderSide(
+                              color: Colors.white.withOpacity(0.08),
+                            ),
                           ),
                         ),
                       ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
-              const Divider(height: 1),
               Expanded(
                 child: showGrid
                     ? _buildPokedexGrid(context, total, ownedMap, previewMap)
@@ -1241,147 +5943,108 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
     Map<int, PokemonCardResult> ownedMap,
     Map<int, PreviewCard> previewMap,
   ) {
-    final qNum = _parseInt(_query);
+    final slots = _filteredSlots(total, ownedMap, previewMap);
 
-    final slots = (qNum != null && qNum >= 1 && qNum <= total)
-        ? <int>[qNum]
-        : List<int>.generate(total, (i) => i + 1);
-
-    return GridView.builder(
-      padding: const EdgeInsets.all(12),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 5,
-        mainAxisSpacing: 10,
-        crossAxisSpacing: 10,
-        childAspectRatio: 0.72,
-      ),
-      itemCount: slots.length,
-      itemBuilder: (context, idx) {
-        final slot = slots[idx];
-        final owned = ownedMap[slot];
-        final preview = previewMap[slot];
-
-        if (owned != null) {
-          return _OwnedSlotTile(
-            slot: slot,
-            card: owned,
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => CardShowcaseScreen(card: owned),
+    if (slots.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.search_off_rounded,
+                size: 42,
+                color: Colors.white.withOpacity(0.5),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'No cards match this filter.',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Try a card name like Charizard or a slot number like 39.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  height: 1.4,
+                  color: Colors.white.withOpacity(0.72),
                 ),
-              );
-            },
-          );
-        }
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
-        return _MissingSlotTile(
-          slot: slot,
-          previewImageUrl: preview?.imageSmall,
-          previewName: preview?.name,
-          onTap: () => _showSlotSheet(slot: slot, preview: preview),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final crossAxisCount = _gridCrossAxisCount(constraints.maxWidth);
+        final cacheExtent = (constraints.maxHeight * 0.5).clamp(240.0, 640.0);
+
+        _maybeRevealInitialSlot(
+          slots: slots,
+          crossAxisCount: crossAxisCount,
+          maxWidth: constraints.maxWidth,
+        );
+
+        return GridView.builder(
+          controller: _gridScrollCtrl,
+          cacheExtent: cacheExtent,
+          addAutomaticKeepAlives: false,
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 20),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            mainAxisSpacing: 12,
+            crossAxisSpacing: 12,
+            childAspectRatio: 0.7,
+          ),
+          itemCount: slots.length,
+          itemBuilder: (context, idx) {
+            final slot = slots[idx];
+            final owned = ownedMap[slot];
+            final preview = previewMap[slot];
+
+            if (owned != null) {
+              return _OwnedSlotTile(
+                slot: slot,
+                card: owned,
+                isJustUnlocked: _justUnlockedSlot == slot,
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => OwnedCardShowcaseScreen(card: owned),
+                    ),
+                  );
+                },
+              );
+            }
+
+            return _MissingSlotTile(
+              slot: slot,
+              previewImageUrl: preview?.imageSmall,
+              previewName: preview?.name,
+              showPreviewLabel: _query.trim().isNotEmpty,
+              isFocused: _justUnlockedSlot == slot,
+              onTap: () => _showSlotSheet(slot: slot, preview: preview),
+            );
+          },
         );
       },
     );
   }
 
   void _showSlotSheet({required int slot, required PreviewCard? preview}) {
-    showModalBottomSheet(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) {
-        final title = preview == null
-            ? 'Card #$slot not registered yet'
-            : '${preview.name}  •  #$slot';
-
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 10),
-              Center(
-                child: SizedBox(
-                  height: 150,
-                  child: AspectRatio(
-                    aspectRatio: 0.72,
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(14),
-                      child: preview != null && preview.imageSmall.isNotEmpty
-                          ? ColorFiltered(
-                              colorFilter: const ColorFilter.matrix(
-                                kGreyMatrix,
-                              ),
-                              child: Image.network(
-                                preview.imageSmall,
-                                fit: BoxFit.cover,
-                              ),
-                            )
-                          : Container(
-                              color: const Color(0xFF1F1F1F),
-                              child: Stack(
-                                children: [
-                                  const Center(
-                                    child: Icon(Icons.style, size: 46),
-                                  ),
-                                  Positioned(
-                                    left: 10,
-                                    top: 10,
-                                    child: Text(
-                                      '#$slot',
-                                      style: const TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.w800,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                preview == null
-                    ? "Unknown card (preview not loaded yet)."
-                    : "This is the correct card for slot #$slot. Scan it to register this slot.",
-              ),
-              const SizedBox(height: 14),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.camera_alt),
-                  label: const Text('Scan this card'),
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => ScanScreen(
-                          cameras: gCameras,
-                          expectedSetId: widget.setKey,
-                          expectedSlot: slot,
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        );
-      },
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => LockedCardShowcaseScreen(
+          slot: slot,
+          preview: preview,
+          setKey: widget.setKey,
+        ),
+      ),
     );
   }
 
@@ -1418,7 +6081,9 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
             onTap: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(builder: (_) => CardShowcaseScreen(card: c)),
+                MaterialPageRoute(
+                  builder: (_) => OwnedCardShowcaseScreen(card: c),
+                ),
               );
             },
           ),
@@ -1426,6 +6091,930 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
       },
     );
   }
+}
+
+class LockedCardShowcaseScreen extends StatelessWidget {
+  final int slot;
+  final PreviewCard? preview;
+  final String setKey;
+
+  const LockedCardShowcaseScreen({
+    super.key,
+    required this.slot,
+    required this.preview,
+    required this.setKey,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final name = (preview?.name ?? '').trim();
+    final title = name.isNotEmpty ? name : 'Register #$slot';
+    final subtitle = name.isNotEmpty ? '$name - Slot #$slot' : 'Slot #$slot';
+
+    final img = (preview?.imageSmall ?? '').trim();
+    final label = '#$slot';
+
+    return Scaffold(
+      appBar: AppBar(title: Text('Register #$slot')),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: constraints.maxHeight - 28,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Header
+                    Column(
+                      children: [
+                        Text(
+                          title,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          subtitle,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurface.withOpacity(0.75),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    // Stage / Card
+                    AspectRatio(
+                      aspectRatio: 0.95,
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: CustomPaint(painter: _SpotlightPainter()),
+                          ),
+                          Center(
+                            child: _LockedStageCard(
+                              slot: slot,
+                              imageUrl: img,
+                              label: label,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    _LockedPanel(
+                      title: 'Details',
+                      subtitle: 'Locked until you scan this card.',
+                      icon: Icons.lock,
+                    ),
+                    const SizedBox(height: 10),
+                    _LockedPanel(
+                      title: 'eBay',
+                      subtitle: 'Listings unlock after registration.',
+                      icon: Icons.lock,
+                    ),
+
+                    const SizedBox(height: 14),
+
+                    SizedBox(
+                      width: double.infinity,
+                      height: 56,
+                      child: ElevatedButton.icon(
+                        onPressed: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => ScanScreen(
+                                cameras: gCameras,
+                                expectedSetId: setKey,
+                                expectedSlot: slot,
+                              ),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.camera_alt),
+                        label: const Text('Scan this card'),
+                      ),
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    SizedBox(
+                      width: double.infinity,
+                      height: 56,
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('Back to Pokédex'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class PokedexRegisterAnimationScreen extends StatefulWidget {
+  final PokemonCardResult card;
+  final String setKey;
+  final int slot;
+
+  const PokedexRegisterAnimationScreen({
+    super.key,
+    required this.card,
+    required this.setKey,
+    required this.slot,
+  });
+
+  @override
+  State<PokedexRegisterAnimationScreen> createState() =>
+      _PokedexRegisterAnimationScreenState();
+}
+
+class _PokedexRegisterAnimationScreenState
+    extends State<PokedexRegisterAnimationScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+
+  late final Animation<double> _fadeIn;
+  late final Animation<double> _spin;
+  late final Animation<double> _drop;
+  late final Animation<double> _impact;
+
+  bool _didPrecache = false;
+  bool _imageReady = false;
+
+  String get _cardUrl => widget.card.imageSmall.isNotEmpty
+      ? widget.card.imageSmall
+      : widget.card.imageLarge;
+
+  bool get _showColor => _c.value > 0.62;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _c = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    );
+
+    _fadeIn = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.0, 0.12, curve: Curves.easeOut),
+    );
+
+    _spin = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.08, 0.78, curve: Curves.easeOutCubic),
+    );
+
+    _drop = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.0, 0.62, curve: Curves.easeOutCubic),
+    );
+
+    _impact = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.62, 1.0, curve: Curves.elasticOut),
+    );
+
+    _c.addStatusListener((s) {
+      if (s == AnimationStatus.completed && mounted) {
+        _finishToShowcase();
+      }
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_didPrecache) return;
+    _didPrecache = true;
+
+    final url = _cardUrl;
+    if (url.isEmpty) {
+      _imageReady = true;
+      _c.forward();
+      return;
+    }
+
+    // âœ… Safe: context is valid here
+    precacheImage(NetworkImage(url), context)
+        .then((_) {
+          if (!mounted) return;
+          setState(() => _imageReady = true);
+          _c.forward();
+        })
+        .catchError((_) {
+          if (!mounted) return;
+          setState(() => _imageReady = true);
+          _c.forward();
+        });
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  void _finishToShowcase() {
+    // Return to PokÃ©dex page, then open owned showcase
+    Navigator.popUntil(context, (r) => r.settings.name == 'set_pokedex');
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => OwnedCardShowcaseScreen(card: widget.card),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final url = _cardUrl;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF05070D),
+      body: SafeArea(
+        child: FadeTransition(
+          opacity: _fadeIn,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: CustomPaint(painter: _StageLightsPainter()),
+              ),
+
+              Center(
+                child: AnimatedBuilder(
+                  animation: _c,
+                  builder: (context, _) {
+                    // If image isn't ready yet, show a steady greyscale card (no black flash)
+                    if (!_imageReady) {
+                      return _buildCard(url, grey: true, scale: 0.98);
+                    }
+
+                    final spins = 6.0; // readable spins
+                    final turns = _spin.value * spins * 2 * 3.1415926;
+
+                    final y = lerpDouble(80, 0, _drop.value)!;
+                    final scale = lerpDouble(0.92, 1.0, _impact.value)!;
+
+                    return Transform.translate(
+                      offset: Offset(0, y),
+                      child: Transform.scale(
+                        scale: scale,
+                        child: Transform(
+                          alignment: Alignment.center,
+                          transform: Matrix4.identity()
+                            ..setEntry(3, 2, 0.0018)
+                            ..rotateY(turns),
+                          child: _buildCard(url, grey: !_showColor),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 32,
+                child: AnimatedBuilder(
+                  animation: _c,
+                  builder: (_, __) {
+                    final show = _c.value > 0.66;
+                    return AnimatedOpacity(
+                      opacity: show ? 1 : 0,
+                      duration: const Duration(milliseconds: 250),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.10),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: Colors.white.withOpacity(0.16),
+                              ),
+                            ),
+                            child: const Text(
+                              'ADDED TO COLLECTION!',
+                              style: TextStyle(
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 1.2,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            'CARD #${widget.slot} REGISTERED',
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            widget.card.name,
+                            style: TextStyle(
+                              color: Colors.white.withOpacity(0.85),
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCard(String url, {required bool grey, double scale = 1.0}) {
+    final card = ClipRRect(
+      borderRadius: BorderRadius.circular(18),
+      child: url.isEmpty
+          ? Container(
+              width: 260,
+              height: 360,
+              color: const Color(0xFF1F1F1F),
+              child: const Center(child: Icon(Icons.style, size: 48)),
+            )
+          : Image.network(url, width: 260, height: 360, fit: BoxFit.cover),
+    );
+
+    final w = grey
+        ? ColorFiltered(
+            colorFilter: const ColorFilter.matrix(kGreyMatrix),
+            child: card,
+          )
+        : card;
+
+    return Transform.scale(scale: scale, child: w);
+  }
+}
+
+class AddedToCollectionAnimationScreen extends StatefulWidget {
+  final PokemonCardResult card;
+
+  const AddedToCollectionAnimationScreen({super.key, required this.card});
+
+  @override
+  State<AddedToCollectionAnimationScreen> createState() =>
+      _AddedToCollectionAnimationScreenState();
+}
+
+class _AddedToCollectionAnimationScreenState
+    extends State<AddedToCollectionAnimationScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  late final Animation<double> _spin;
+  late final Animation<double> _drop;
+  late final Animation<double> _impact;
+
+  Future<void>? _precacheFuture;
+  bool _started = false;
+
+  String get _cardUrl => widget.card.imageLarge.isNotEmpty
+      ? widget.card.imageLarge
+      : widget.card.imageSmall;
+
+  bool get _showColor => _c.value > 0.62;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _c = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    );
+
+    _spin = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.08, 0.78, curve: Curves.easeOutCubic),
+    );
+
+    _drop = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.0, 0.62, curve: Curves.easeOutCubic),
+    );
+
+    _impact = CurvedAnimation(
+      parent: _c,
+      curve: const Interval(0.62, 1.0, curve: Curves.elasticOut),
+    );
+
+    _c.addStatusListener((s) {
+      if (s == AnimationStatus.completed && mounted) {
+        _finishToShowcase();
+      }
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_precacheFuture != null) return; // run once
+
+    final url = _cardUrl.trim();
+
+    _precacheFuture = url.isEmpty
+        ? Future.value()
+        : precacheImage(NetworkImage(url), context);
+
+    _precacheFuture!.then((_) {
+      if (!mounted || _started) return;
+      _started = true;
+      _c.forward();
+    });
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  void _finishToShowcase() {
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => OwnedCardShowcaseScreen(card: widget.card),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final url = _cardUrl;
+    final future = _precacheFuture ?? Future.value();
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF05070D),
+      body: SafeArea(
+        child: FutureBuilder<void>(
+          future: future,
+          builder: (context, snap) {
+            final ready = snap.connectionState == ConnectionState.done;
+
+            if (!ready) {
+              return Stack(
+                children: [
+                  Positioned.fill(
+                    child: CustomPaint(painter: _StageLightsPainter()),
+                  ),
+                  Center(child: _buildCard(url, grey: true, scale: 0.98)),
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 24,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: const [
+                        SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        SizedBox(height: 10),
+                        Text(
+                          'Adding to collection...',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }
+
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: CustomPaint(painter: _StageLightsPainter()),
+                ),
+                Center(
+                  child: AnimatedBuilder(
+                    animation: _c,
+                    builder: (context, _) {
+                      final spins = 6.0;
+                      final turns = _spin.value * spins * 2 * 3.1415926;
+
+                      final y = lerpDouble(80, 0, _drop.value)!;
+                      final scale = lerpDouble(0.92, 1.0, _impact.value)!;
+
+                      return Transform.translate(
+                        offset: Offset(0, y),
+                        child: Transform.scale(
+                          scale: scale,
+                          child: Transform(
+                            alignment: Alignment.center,
+                            transform: Matrix4.identity()
+                              ..setEntry(3, 2, 0.0018)
+                              ..rotateY(turns),
+                            child: _buildCard(url, grey: !_showColor),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 32,
+                  child: AnimatedBuilder(
+                    animation: _c,
+                    builder: (_, __) {
+                      final show = _c.value > 0.66;
+                      return AnimatedOpacity(
+                        opacity: show ? 1 : 0,
+                        duration: const Duration(milliseconds: 250),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.10),
+                                borderRadius: BorderRadius.circular(999),
+                                border: Border.all(
+                                  color: Colors.white.withOpacity(0.16),
+                                ),
+                              ),
+                              child: const Text(
+                                'ADDED TO COLLECTION!',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 1.2,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              widget.card.name,
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.90),
+                                fontSize: 20,
+                                fontWeight: FontWeight.w900,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCard(String url, {required bool grey, double scale = 1.0}) {
+    final card = ClipRRect(
+      borderRadius: BorderRadius.circular(18),
+      child: url.isEmpty
+          ? Container(
+              width: 260,
+              height: 360,
+              color: const Color(0xFF1F1F1F),
+              child: const Center(child: Icon(Icons.style, size: 48)),
+            )
+          : Image.network(url, width: 260, height: 360, fit: BoxFit.cover),
+    );
+
+    final w = grey
+        ? ColorFiltered(
+            colorFilter: const ColorFilter.matrix(kGreyMatrix),
+            child: card,
+          )
+        : card;
+
+    return Transform.scale(scale: scale, child: w);
+  }
+}
+
+class _StageLightsPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bg = Paint()..color = const Color(0xFF05070D);
+    canvas.drawRect(Offset.zero & size, bg);
+
+    // Two soft cones of light
+    final p = Paint()
+      ..shader =
+          RadialGradient(
+            colors: [
+              const Color(0xFF9CA3AF).withOpacity(0.22),
+              Colors.transparent,
+            ],
+            stops: const [0.0, 1.0],
+          ).createShader(
+            Rect.fromCircle(
+              center: Offset(size.width * 0.28, size.height * 0.02),
+              radius: size.width * 0.55,
+            ),
+          );
+
+    final p2 = Paint()
+      ..shader =
+          RadialGradient(
+            colors: [
+              const Color(0xFF9CA3AF).withOpacity(0.18),
+              Colors.transparent,
+            ],
+            stops: const [0.0, 1.0],
+          ).createShader(
+            Rect.fromCircle(
+              center: Offset(size.width * 0.72, size.height * 0.02),
+              radius: size.width * 0.55,
+            ),
+          );
+
+    canvas.drawRect(Offset.zero & size, p);
+    canvas.drawRect(Offset.zero & size, p2);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class _LockedPanel extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final IconData icon;
+
+  const _LockedPanel({
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      padding: const EdgeInsets.all(14),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, size: 20),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w900,
+                    fontSize: 14,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.7),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Icon(Icons.chevron_right),
+        ],
+      ),
+    );
+  }
+}
+
+class _LockedStageCard extends StatelessWidget {
+  final int slot;
+  final String imageUrl;
+  final String label;
+
+  const _LockedStageCard({
+    required this.slot,
+    required this.imageUrl,
+    required this.label,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final hasImage = imageUrl.isNotEmpty;
+
+    return LayoutBuilder(
+      builder: (context, c) {
+        // Available height inside the stage area
+        final maxH = c.maxHeight;
+
+        // Keep the card readable but NEVER exceed the available height
+        final cardH = maxH * 0.82; // card takes most of the stage
+        final cardW = cardH * 0.72;
+
+        final pedestalH = maxH * 0.06;
+        final pedestalGap = maxH * 0.04;
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              height: cardH,
+              width: cardW,
+              child: Stack(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(18),
+                    child: hasImage
+                        ? ColorFiltered(
+                            colorFilter: const ColorFilter.matrix(kGreyMatrix),
+                            child: Image.network(imageUrl, fit: BoxFit.cover),
+                          )
+                        : Container(
+                            color: const Color(0xFF141824),
+                            alignment: Alignment.center,
+                            child: Text(
+                              label,
+                              style: const TextStyle(
+                                fontSize: 28,
+                                fontWeight: FontWeight.w900,
+                              ),
+                            ),
+                          ),
+                  ),
+
+                  // vignette
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: RadialGradient(
+                          radius: 1.2,
+                          colors: [
+                            Colors.transparent,
+                            Colors.black.withOpacity(0.55),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // lock badge
+                  Positioned(
+                    right: 10,
+                    top: 10,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.55),
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.15),
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.lock, size: 16),
+                          const SizedBox(width: 6),
+                          Text(
+                            'LOCKED',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 1.2,
+                              color: Colors.white.withOpacity(0.92),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            SizedBox(height: pedestalGap),
+
+            // pedestal (scales with available space)
+            Container(
+              width: cardW * 0.85,
+              height: pedestalH,
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.06),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            SizedBox(height: pedestalH * 0.5),
+            Container(
+              width: cardW * 0.55,
+              height: pedestalH * 0.55,
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.04),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _SpotlightPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+
+    Paint cone(double xCenter, double topY, double bottomY, double spread) {
+      return Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            Colors.white.withOpacity(0.12),
+            Colors.white.withOpacity(0.00),
+          ],
+        ).createShader(Rect.fromLTWH(0, 0, w, h));
+    }
+
+    // Left cone
+    final p1 = Path()
+      ..moveTo(w * 0.18, 0)
+      ..lineTo(w * 0.02, h * 0.62)
+      ..lineTo(w * 0.34, h * 0.62)
+      ..close();
+    canvas.drawPath(p1, cone(w * 0.18, 0, h * 0.62, 0.3));
+
+    // Right cone
+    final p2 = Path()
+      ..moveTo(w * 0.82, 0)
+      ..lineTo(w * 0.66, h * 0.62)
+      ..lineTo(w * 0.98, h * 0.62)
+      ..close();
+    canvas.drawPath(p2, cone(w * 0.82, 0, h * 0.62, 0.3));
+
+    // Center glow behind card
+    final glow = Paint()
+      ..shader = RadialGradient(
+        radius: 0.55,
+        colors: [Colors.white.withOpacity(0.10), Colors.transparent],
+      ).createShader(Rect.fromLTWH(0, 0, w, h));
+    canvas.drawCircle(Offset(w * 0.5, h * 0.36), w * 0.42, glow);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
 class _CollectedOverlay extends StatefulWidget {
@@ -1541,11 +7130,13 @@ class _CollectedOverlayState extends State<_CollectedOverlay>
   }
 }
 
-/// Missing tile supports optional grayscale preview (Pokédex only)
+/// Missing tile supports optional grayscale preview (PokÃ©dex only)
 class _MissingSlotTile extends StatelessWidget {
   final int slot;
   final String? previewImageUrl;
   final String? previewName;
+  final bool showPreviewLabel;
+  final bool isFocused;
   final VoidCallback onTap;
 
   const _MissingSlotTile({
@@ -1553,64 +7144,179 @@ class _MissingSlotTile extends StatelessWidget {
     required this.onTap,
     this.previewImageUrl,
     this.previewName,
+    this.showPreviewLabel = false,
+    this.isFocused = false,
     super.key,
   });
 
   @override
   Widget build(BuildContext context) {
     final hasPreview = previewImageUrl != null && previewImageUrl!.isNotEmpty;
+    final showName =
+        previewName != null && previewName!.trim().isNotEmpty && hasPreview;
+    final highlightColor = const Color(0xFF7DD3FC);
 
-    return InkWell(
-      borderRadius: BorderRadius.circular(14),
-      onTap: onTap,
-      child: Ink(
-        decoration: BoxDecoration(
-          color: const Color(0xFF1C1F26),
-          borderRadius: BorderRadius.circular(14),
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(14),
-          child: Stack(
-            children: [
-              if (hasPreview)
-                Positioned.fill(
-                  child: Opacity(
-                    opacity: 0.75,
-                    child: ColorFiltered(
-                      colorFilter: const ColorFilter.matrix(kGreyMatrix),
-                      child: Image.network(previewImageUrl!, fit: BoxFit.cover),
-                    ),
+    return TweenAnimationBuilder<double>(
+      key: ValueKey('missing-slot-$slot-$isFocused'),
+      tween: Tween<double>(begin: 0, end: isFocused ? 1 : 0),
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeOutBack,
+      builder: (context, highlightT, _) {
+        final scale = isFocused ? lerpDouble(0.92, 1.0, highlightT)! : 1.0;
+        final borderColor = Color.lerp(
+          Colors.white.withOpacity(0.08),
+          highlightColor.withOpacity(0.9),
+          highlightT,
+        )!;
+
+        return Transform.scale(
+          scale: scale,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(16),
+            onTap: onTap,
+            child: Ink(
+              decoration: BoxDecoration(
+                color: const Color(0xFF1C1F26),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: borderColor),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.16),
+                    blurRadius: 14,
+                    offset: const Offset(0, 8),
                   ),
-                )
-              else
-                const Center(
-                  child: Icon(Icons.style, size: 40, color: Colors.white24),
-                ),
-              Positioned(
-                left: 8,
-                top: 8,
-                child: Text(
-                  '$slot',
-                  style: const TextStyle(fontWeight: FontWeight.w900),
+                  if (highlightT > 0)
+                    BoxShadow(
+                      color: highlightColor.withOpacity(0.24 * highlightT),
+                      blurRadius: lerpDouble(12, 24, highlightT)!,
+                      spreadRadius: lerpDouble(0, 2, highlightT)!,
+                    ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: Stack(
+                  children: [
+                    if (hasPreview)
+                      Positioned.fill(
+                        child: Opacity(
+                          opacity: 0.68,
+                          child: ColorFiltered(
+                            colorFilter: const ColorFilter.matrix(kGreyMatrix),
+                            child: Image.network(
+                              previewImageUrl!,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                        ),
+                      )
+                    else
+                      const Center(
+                        child: Icon(
+                          Icons.style,
+                          size: 40,
+                          color: Colors.white24,
+                        ),
+                      ),
+                    Positioned.fill(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Colors.black.withOpacity(0.12),
+                              Colors.black.withOpacity(0.08),
+                              Colors.black.withOpacity(0.58),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 8,
+                      top: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.45),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          '$slot',
+                          style: const TextStyle(fontWeight: FontWeight.w900),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      right: 8,
+                      top: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.52),
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.10),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: const [
+                            Icon(
+                              Icons.lock_outline,
+                              size: 12,
+                              color: Colors.white70,
+                            ),
+                            SizedBox(width: 4),
+                            Text(
+                              'LOCKED',
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 0.5,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (showPreviewLabel && showName)
+                      Positioned(
+                        left: 8,
+                        right: 8,
+                        bottom: 8,
+                        child: _SlotStateFooter(
+                          title: previewName!,
+                          subtitle: 'Tap to scan and unlock',
+                          locked: true,
+                        ),
+                      ),
+                    if (!showPreviewLabel || !showName)
+                      Positioned(
+                        left: 8,
+                        right: 8,
+                        bottom: 8,
+                        child: _SlotStateFooter(
+                          title: hasPreview ? 'Missing card' : 'Unknown card',
+                          subtitle: 'Tap to scan and unlock',
+                          locked: true,
+                        ),
+                      ),
+                  ],
                 ),
               ),
-              if (!hasPreview)
-                Positioned(
-                  left: 8,
-                  right: 8,
-                  bottom: 8,
-                  child: Text(
-                    'Missing',
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.85),
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -1618,50 +7324,262 @@ class _MissingSlotTile extends StatelessWidget {
 class _OwnedSlotTile extends StatelessWidget {
   final int slot;
   final PokemonCardResult card;
+  final bool isJustUnlocked;
   final VoidCallback onTap;
 
   const _OwnedSlotTile({
     required this.slot,
     required this.card,
+    this.isJustUnlocked = false,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(14),
-      onTap: onTap,
-      child: Stack(
-        children: [
-          Positioned.fill(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(14),
-              child: card.imageSmall.isEmpty
-                  ? Container(
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.surfaceContainerHighest,
-                      child: const Icon(Icons.image_not_supported),
-                    )
-                  : Image.network(card.imageSmall, fit: BoxFit.cover),
-            ),
+    if (!isJustUnlocked) {
+      return _OwnedSlotTileBody(slot: slot, card: card, onTap: onTap);
+    }
+
+    final highlightColor = const Color(0xFF7DD3FC);
+
+    return TweenAnimationBuilder<double>(
+      key: ValueKey('owned-slot-$slot-$isJustUnlocked'),
+      tween: Tween<double>(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeOutBack,
+      builder: (context, highlightT, _) {
+        return Transform.scale(
+          scale: lerpDouble(0.92, 1.0, highlightT)!,
+          child: _OwnedSlotTileBody(
+            slot: slot,
+            card: card,
+            onTap: onTap,
+            isJustUnlocked: true,
+            highlightT: highlightT,
+            highlightColor: highlightColor,
           ),
-          Positioned(
-            left: 8,
-            top: 8,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.55),
-                borderRadius: BorderRadius.circular(999),
+        );
+      },
+    );
+  }
+}
+
+class _OwnedSlotTileBody extends StatelessWidget {
+  final int slot;
+  final PokemonCardResult card;
+  final VoidCallback onTap;
+  final bool isJustUnlocked;
+  final double highlightT;
+  final Color highlightColor;
+
+  const _OwnedSlotTileBody({
+    required this.slot,
+    required this.card,
+    required this.onTap,
+    this.isJustUnlocked = false,
+    this.highlightT = 0,
+    this.highlightColor = const Color(0xFF7DD3FC),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final borderColor = Color.lerp(
+      Colors.white.withOpacity(0.08),
+      highlightColor.withOpacity(0.90),
+      highlightT,
+    )!;
+    final baseShadow = BoxShadow(
+      color: Colors.black.withOpacity(0.16),
+      blurRadius: 14,
+      offset: const Offset(0, 8),
+    );
+    final pulseShadow = BoxShadow(
+      color: highlightColor.withOpacity(0.28 * highlightT),
+      blurRadius: lerpDouble(12, 26, highlightT)!,
+      spreadRadius: lerpDouble(0, 2, highlightT)!,
+    );
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(16),
+      onTap: onTap,
+      child: Ink(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: borderColor),
+          boxShadow: [baseShadow, if (highlightT > 0) pulseShadow],
+        ),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: card.imageSmall.isEmpty
+                    ? Container(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.surfaceContainerHighest,
+                        child: const Icon(Icons.image_not_supported),
+                      )
+                    : Image.network(
+                        card.imageSmall,
+                        fit: BoxFit.cover,
+                        filterQuality: FilterQuality.low,
+                        cacheWidth: 360,
+                      ),
               ),
-              child: Text(
-                '$slot',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w800,
+            ),
+            if (highlightT > 0)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: highlightColor.withOpacity(0.65 * highlightT),
+                        width: lerpDouble(1.2, 2.6, highlightT)!,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: highlightColor.withOpacity(0.22 * highlightT),
+                          blurRadius: 20,
+                          spreadRadius: 1,
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.transparent,
+                      Colors.transparent,
+                      Colors.black.withOpacity(0.48),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: 8,
+              top: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.55),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  '$slot',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              right: 8,
+              top: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isJustUnlocked
+                      ? Color.lerp(
+                          const Color(0xFF0F7B43).withOpacity(0.9),
+                          const Color(0xFF0369A1).withOpacity(0.95),
+                          highlightT,
+                        )
+                      : const Color(0xFF0F7B43).withOpacity(0.9),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: Colors.white.withOpacity(0.10)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      isJustUnlocked ? Icons.auto_awesome : Icons.check_circle,
+                      size: 12,
+                      color: Colors.white,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      isJustUnlocked ? 'NEW' : 'OWNED',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            Positioned(
+              left: 8,
+              right: 8,
+              bottom: 8,
+              child: _SlotStateFooter(
+                title: card.name,
+                subtitle: '#${card.number}',
+                locked: false,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SlotStateFooter extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final bool locked;
+
+  const _SlotStateFooter({
+    required this.title,
+    required this.subtitle,
+    required this.locked,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.42),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.white.withOpacity(locked ? 0.82 : 0.92),
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.white.withOpacity(locked ? 0.64 : 0.78),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
             ),
           ),
         ],
@@ -1676,12 +7594,16 @@ class PokemonCardDetailsScreen extends StatefulWidget {
   final PokemonCardResult card;
   final String? expectedSetId;
   final int? expectedSlot;
+  final bool compactAddMode;
+  final bool readOnly;
 
   const PokemonCardDetailsScreen({
     super.key,
     required this.card,
     this.expectedSetId,
     this.expectedSlot,
+    this.compactAddMode = false,
+    this.readOnly = false,
   });
 
   @override
@@ -1692,13 +7614,14 @@ class PokemonCardDetailsScreen extends StatefulWidget {
 class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
   String? _selectedFinish;
   int _grade = 8;
-
   late Future<PokemonCardResult?> _fullFuture;
 
   @override
   void initState() {
     super.initState();
-    _fullFuture = PokemonTcgApi().fetchCardById(widget.card.id);
+    _fullFuture = widget.compactAddMode || widget.readOnly
+        ? Future.value(null)
+        : PokemonTcgApi().fetchCardById(widget.card.id);
 
     if (widget.card.finishes.isNotEmpty) {
       const preferred = ['normal', 'holofoil', 'reverseHolofoil'];
@@ -1712,7 +7635,7 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
     }
   }
 
-  String _money(double? v) => v == null ? '—' : '\$${v.toStringAsFixed(2)}';
+  String _money(double? v) => v == null ? '-' : '\$${v.toStringAsFixed(2)}';
 
   String? _defaultFinishFor(Map<String, PriceRow> finishes) {
     if (finishes.isEmpty) return null;
@@ -1731,8 +7654,7 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
   double? _estimatedValue(PokemonCardResult card, String? finish) {
     final base = _baseMarket(card, finish);
     if (base == null) return null;
-    final multiplier = _grade / 10.0;
-    return base * multiplier;
+    return base * (_grade / 10.0);
   }
 
   Future<void> _openLink(String url) async {
@@ -1755,264 +7677,763 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
     return cardSet == expectedSetId && cardNum == expectedSlot;
   }
 
+  Future<PokemonCardResult> _attachMarketValue(PokemonCardResult card) async {
+    if (card.marketValue != null) return card;
+
+    final query = buildEbayQuery(
+      name: card.name,
+      setName: card.setName,
+      number: card.number,
+      printedTotal: card.setPrintedTotal,
+      mode: EbayMode.raw,
+    );
+
+    final marketValue = await fetchEbayMarketValue(query: query);
+    if (marketValue == null) return card;
+    return card.copyWith(marketValue: marketValue);
+  }
+
+  Future<void> _enrichSavedCardMarketValue(PokemonCardResult card) async {
+    if (card.marketValue != null) return;
+
+    final enrichedCard = await _attachMarketValue(card);
+    final marketValue = enrichedCard.marketValue;
+    if (marketValue == null) return;
+
+    collectionStore.updateCardMarketValueIfMissing(
+      cardId: card.id,
+      marketValue: marketValue,
+    );
+  }
+
+  Future<void> _saveCard(PokemonCardResult card) async {
+    if (!_hasPersistentCollectionAccess(FirebaseAuth.instance.currentUser)) {
+      if (!mounted) return;
+      await _showAccountRequiredToSavePrompt(context);
+      return;
+    }
+
+    final expectedSetId = widget.expectedSetId;
+    final expectedSlot = widget.expectedSlot;
+    final fromPokedex = expectedSetId != null && expectedSlot != null;
+
+    final already = collectionStore.containsCardId(card.id);
+    if (already) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Already in your collection.')),
+      );
+
+      if (!fromPokedex && widget.compactAddMode) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => OwnedCardShowcaseScreen(card: card),
+          ),
+        );
+      }
+      return;
+    }
+
+    if (fromPokedex) {
+      final ok = _slotAcceptsCard(
+        card: card,
+        expectedSetId: expectedSetId!,
+        expectedSlot: expectedSlot!,
+      );
+      if (!ok) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Wrong card for this Pokédex slot. Please rescan.'),
+          ),
+        );
+        return;
+      }
+    }
+
+    final cardToSave = card;
+
+    collectionStore.addCard(cardToSave);
+    unawaited(_enrichSavedCardMarketValue(cardToSave));
+
+    if (fromPokedex) {
+      collectionStore.emitCollected(
+        CollectedEvent(
+          setKey: expectedSetId!,
+          slot: expectedSlot!,
+          cardName: cardToSave.name,
+          imageUrl: cardToSave.imageLarge.isNotEmpty
+              ? cardToSave.imageLarge
+              : cardToSave.imageSmall,
+        ),
+      );
+    }
+
+    if (!mounted) return;
+    setState(() {});
+
+    if (fromPokedex) {
+      Navigator.popUntil(
+        context,
+        (route) => route.settings.name == 'set_pokedex',
+      );
+      return;
+    }
+
+    if (widget.compactAddMode) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => AddedToCollectionAnimationScreen(card: cardToSave),
+        ),
+      );
+      return;
+    }
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => OwnedCardShowcaseScreen(card: cardToSave),
+      ),
+    );
+  }
+
+  Widget _glassCard({
+    required Widget child,
+    EdgeInsetsGeometry? padding,
+    Color? accentColor,
+  }) {
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            accentColor?.withOpacity(0.12) ?? Colors.white.withOpacity(0.065),
+            Colors.white.withOpacity(0.022),
+          ],
+        ),
+        border: Border.all(
+          color:
+              accentColor?.withOpacity(0.20) ?? Colors.white.withOpacity(0.08),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.24),
+            blurRadius: 22,
+            offset: const Offset(0, 14),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+
+  Widget _buildHero(PokemonCardResult card, {Color? accentColor}) {
+    return _glassCard(
+      accentColor: accentColor,
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 360),
+              child: AspectRatio(
+                aspectRatio: 63 / 88,
+                child: PokemonCardShowcase(card: card, animate: true),
+              ),
+            ),
+          ),
+          const SizedBox(height: 18),
+          Text(
+            card.name.isEmpty ? 'Unknown Card' : card.name,
+            style: const TextStyle(
+              fontSize: 28,
+              fontWeight: FontWeight.w900,
+              height: 1.04,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '${card.setName} - #${card.number}',
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.74),
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBrowseNotice({required Color accentColor}) {
+    return _glassCard(
+      accentColor: accentColor,
+      padding: const EdgeInsets.all(16),
+      child: Text(
+        'Manual Search is browse-only. Scan cards to add them to your collection.',
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: Colors.white.withOpacity(0.80),
+          fontWeight: FontWeight.w700,
+          height: 1.35,
+        ),
+      ),
+    );
+  }
+
+  Uri _browseOnlyEbaySearchUrl(PokemonCardResult card) {
+    final q = Uri.encodeComponent(
+      '${card.name} ${card.number} ${card.setName}',
+    );
+    return Uri.parse('https://www.ebay.com/sch/i.html?_nkw=$q');
+  }
+
+  Uri _browseOnlyEbaySoldUrl(PokemonCardResult card) {
+    final q = Uri.encodeComponent(
+      '${card.name} ${card.number} ${card.setName}',
+    );
+    return Uri.parse(
+      'https://www.ebay.com/sch/i.html?_nkw=$q&LH_Sold=1&LH_Complete=1',
+    );
+  }
+
+  Widget _buildReadOnlyMarketSection(
+    PokemonCardResult card, {
+    required Color accentColor,
+    required String ebayQuery,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _glassCard(
+          accentColor: accentColor,
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'eBay',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Open eBay for active or sold listings, or browse the inline preview below.',
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.76),
+                  fontWeight: FontWeight.w600,
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: ElevatedButton.icon(
+                  onPressed: () =>
+                      _openLink(_browseOnlyEbaySearchUrl(card).toString()),
+                  icon: const Icon(Icons.shopping_bag_outlined),
+                  label: const Text('View active listings on eBay'),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: OutlinedButton.icon(
+                  onPressed: () =>
+                      _openLink(_browseOnlyEbaySoldUrl(card).toString()),
+                  icon: const Icon(Icons.query_stats),
+                  label: const Text('View sold listings on eBay'),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        EbayListingPreviewSection(
+          query: ebayQuery,
+          accentColor: accentColor,
+          title: 'eBay Preview',
+        ),
+      ],
+    );
+  }
+
+  Widget _imageFallback() {
+    return Container(
+      color: Colors.white.withOpacity(0.05),
+      child: const Center(
+        child: Icon(
+          Icons.image_not_supported_outlined,
+          size: 40,
+          color: Colors.white54,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<PokemonCardResult?>(
       future: _fullFuture,
       builder: (context, snap) {
-        final loading = snap.connectionState != ConnectionState.done;
-        final pricingError = snap.hasError;
-
-        final full = snap.data;
-        final card = full ?? widget.card;
-
+        final card = snap.data ?? widget.card;
+        final accentColor = cardAccentColor(card);
+        final ebayQuery = buildEbayQuery(
+          name: card.name,
+          setName: card.setName,
+          number: card.number,
+          printedTotal: card.setPrintedTotal,
+          mode: EbayMode.raw,
+        );
         final finish = _selectedFinish ?? _defaultFinishFor(card.finishes);
-        final prices = (finish == null) ? null : card.finishes[finish];
+        final prices = finish == null ? null : card.finishes[finish];
         final base = _baseMarket(card, finish);
         final est = _estimatedValue(card, finish);
-
         final saved = collectionStore.containsCardId(card.id);
+        final loading =
+            !widget.compactAddMode &&
+            !widget.readOnly &&
+            snap.connectionState != ConnectionState.done;
+        final pricingError =
+            !widget.compactAddMode && !widget.readOnly && snap.hasError;
+
+        if (widget.readOnly) {
+          return Scaffold(
+            backgroundColor: const Color(0xFF071018),
+            appBar: AppBar(title: const Text('Card Details')),
+            body: Stack(
+              children: [
+                Positioned.fill(
+                  child: _CardDetailBackdrop(accentColor: accentColor),
+                ),
+                ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    _buildHero(card, accentColor: accentColor),
+                    const SizedBox(height: 16),
+                    _buildBrowseNotice(accentColor: accentColor),
+                    const SizedBox(height: 16),
+                    _buildReadOnlyMarketSection(
+                      card,
+                      accentColor: accentColor,
+                      ebayQuery: ebayQuery,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          );
+        }
 
         return Scaffold(
-          appBar: AppBar(title: const Text('Card Details')),
-          body: ListView(
-            padding: const EdgeInsets.all(16),
+          backgroundColor: const Color(0xFF071018),
+          appBar: AppBar(
+            title: Text(
+              widget.compactAddMode ? 'Confirm Card' : 'Card Details',
+            ),
+          ),
+          body: Stack(
             children: [
-              if (loading)
-                const Padding(
-                  padding: EdgeInsets.only(bottom: 10),
-                  child: LinearProgressIndicator(),
-                ),
-              if (pricingError)
-                const Padding(
-                  padding: EdgeInsets.only(bottom: 10),
-                  child: Text(
-                    'Pricing temporarily unavailable. Showing card info only.',
-                    textAlign: TextAlign.center,
+              Positioned.fill(
+                child: _CardDetailBackdrop(accentColor: accentColor),
+              ),
+              ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  if (loading)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 10),
+                      child: LinearProgressIndicator(),
+                    ),
+                  if (pricingError)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 10),
+                      child: Text(
+                        'Pricing temporarily unavailable. Showing card info only.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  _buildHero(card, accentColor: accentColor),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    height: 54,
+                    child: ElevatedButton.icon(
+                      icon: Icon(saved ? Icons.check : Icons.add),
+                      label: Text(saved ? 'Added' : 'Add to collection'),
+                      onPressed: saved ? null : () => _saveCard(card),
+                    ),
                   ),
-                ),
-              Text(
-                card.name.isEmpty ? '(Loading name…)' : card.name,
-                style: const TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text('${card.setName} • #${card.number}'),
-              const SizedBox(height: 14),
-              if (card.imageLarge.isNotEmpty)
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: Image.network(card.imageLarge, fit: BoxFit.contain),
-                )
-              else
-                const Center(child: Text('No image available')),
-              const SizedBox(height: 14),
-              SizedBox(
-                height: 48,
-                child: ElevatedButton.icon(
-                  icon: Icon(saved ? Icons.check : Icons.add),
-                  label: Text(saved ? 'Saved' : 'Save to My Collection'),
-                  onPressed: saved
-                      ? null
-                      : () async {
-                          final expectedSetId = widget.expectedSetId;
-                          final expectedSlot = widget.expectedSlot;
-
-                          if (expectedSetId != null && expectedSlot != null) {
-                            final ok = _slotAcceptsCard(
-                              card: card,
-                              expectedSetId: expectedSetId,
-                              expectedSlot: expectedSlot,
-                            );
-                            if (!ok) {
-                              if (!mounted) return;
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                  content: Text(
-                                    'Wrong card for this Pokédex slot. Please rescan.',
-                                  ),
-                                ),
-                              );
-                              return;
-                            }
-                          }
-
-                          collectionStore.addCard(card);
-
-                          if (expectedSetId != null && expectedSlot != null) {
-                            collectionStore.emitCollected(
-                              CollectedEvent(
-                                setKey: expectedSetId,
-                                slot: expectedSlot,
-                                cardName: card.name,
-                                imageUrl: card.imageLarge.isNotEmpty
-                                    ? card.imageLarge
-                                    : card.imageSmall,
-                              ),
-                            );
-                          }
-
-                          if (mounted) setState(() {});
-
-                          if (mounted) {
-                            await showPokedexRegistered(
-                              context,
-                              card: card,
-                              slot: expectedSlot,
-                              setNameOverride: card.setName,
-                            );
-                          }
-
-                          final fromPokedex =
-                              widget.expectedSetId != null &&
-                              widget.expectedSlot != null;
-                          if (fromPokedex && mounted) {
-                            Navigator.popUntil(
-                              context,
-                              (route) => route.settings.name == 'set_pokedex',
-                            );
-                          }
-                        },
-                ),
-              ),
-              const SizedBox(height: 16),
-              if (card.finishes.isNotEmpty) ...[
-                const Text(
-                  'Finish',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: card.finishes.keys
-                      .map(
-                        (k) => ChoiceChip(
-                          onSelected: saved
-                              ? null
-                              : (_) => setState(() => _selectedFinish = k),
-                          label: Text(k),
-                          selected: k == finish,
-                        ),
-                      )
-                      .toList()
-                      .cast<Widget>(),
-                ),
-                const SizedBox(height: 16),
-              ],
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        'Pricing (TCGplayer)',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('Market'),
-                          Text(_money(prices?.market ?? card.bestMarket)),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('Low'),
-                          Text(_money(prices?.low)),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('Mid'),
-                          Text(_money(prices?.mid)),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('High'),
-                          Text(_money(prices?.high)),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text(
-                        'Condition (1–10)',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text('Selected grade: $_grade'),
-                      Slider(
-                        value: _grade.toDouble(),
-                        min: 1,
-                        max: 10,
-                        divisions: 9,
-                        label: '$_grade',
-                        onChanged: (v) => setState(() => _grade = v.round()),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        base == null
-                            ? 'No market price available for estimate.'
-                            : 'Estimated value @ grade $_grade: ${_money(est)} (based on market ${_money(base)})',
-                      ),
-                      const SizedBox(height: 10),
-                      OutlinedButton.icon(
+                  if (widget.compactAddMode) ...[
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      height: 54,
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.qr_code_scanner),
+                        label: const Text('Not your card? Rescan'),
                         onPressed: () {
-                          Navigator.push(
+                          Navigator.pushReplacement(
                             context,
                             MaterialPageRoute(
-                              builder: (_) =>
-                                  ConditionGuideScreen(initialGrade: _grade),
+                              builder: (_) => ScanScreen(cameras: gCameras),
                             ),
                           );
                         },
-                        icon: const Icon(Icons.info_outline),
-                        label: const Text('How to grade (guide)'),
                       ),
+                    ),
+                  ] else ...[
+                    const SizedBox(height: 16),
+                    if (card.finishes.isNotEmpty) ...[
+                      const Text(
+                        'Finish',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: card.finishes.keys.map((k) {
+                          return ChoiceChip(
+                            label: Text(k),
+                            selected: k == finish,
+                            onSelected: (_) =>
+                                setState(() => _selectedFinish = k),
+                          );
+                        }).toList(),
+                      ),
+                      const SizedBox(height: 16),
                     ],
-                  ),
-                ),
+                    _glassCard(
+                      accentColor: accentColor,
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Pricing (TCGplayer)',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          _kv(
+                            'Market',
+                            _money(prices?.market ?? card.bestMarket),
+                          ),
+                          _kv('Low', _money(prices?.low)),
+                          _kv('Mid', _money(prices?.mid)),
+                          _kv('High', _money(prices?.high)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    EbayListingPreviewSection(
+                      query: ebayQuery,
+                      accentColor: accentColor,
+                      title: 'eBay Preview',
+                    ),
+                    const SizedBox(height: 16),
+                    _glassCard(
+                      accentColor: accentColor,
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Condition (1-10)',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text('Selected grade: $_grade'),
+                          Slider(
+                            value: _grade.toDouble(),
+                            min: 1,
+                            max: 10,
+                            divisions: 9,
+                            label: '$_grade',
+                            onChanged: (v) =>
+                                setState(() => _grade = v.round()),
+                          ),
+                          Text(
+                            base == null
+                                ? 'No market price available for estimate.'
+                                : 'Estimated value @ grade $_grade: ${_money(est)}',
+                          ),
+                          const SizedBox(height: 10),
+                          OutlinedButton.icon(
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ConditionGuideScreen(
+                                    initialGrade: _grade,
+                                  ),
+                                ),
+                              );
+                            },
+                            icon: const Icon(Icons.info_outline),
+                            label: const Text('How to grade (guide)'),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    if (card.tcgplayerUrl != null &&
+                        card.tcgplayerUrl!.isNotEmpty)
+                      SizedBox(
+                        height: 52,
+                        child: OutlinedButton.icon(
+                          onPressed: () => _openLink(card.tcgplayerUrl!),
+                          icon: const Icon(Icons.open_in_new),
+                          label: const Text('Open TCGplayer listing'),
+                        ),
+                      ),
+                  ],
+                ],
               ),
-              const SizedBox(height: 12),
-              if (card.tcgplayerUrl != null && card.tcgplayerUrl!.isNotEmpty)
-                SizedBox(
-                  height: 48,
-                  child: OutlinedButton.icon(
-                    onPressed: () => _openLink(card.tcgplayerUrl!),
-                    icon: const Icon(Icons.open_in_new),
-                    label: const Text('Open listing'),
-                  ),
-                ),
             ],
           ),
         );
       },
+    );
+  }
+
+  Widget _kv(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.w800)),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReadOnlyEbaySection extends StatelessWidget {
+  final PokemonCardResult card;
+  final Color accentColor;
+  final String ebayQuery;
+
+  const _ReadOnlyEbaySection({
+    required this.card,
+    required this.accentColor,
+    required this.ebayQuery,
+  });
+
+  String _money(double? v) => v == null ? '-' : '\$${v.toStringAsFixed(2)}';
+
+  Uri _ebaySearchUrl() {
+    final q = Uri.encodeComponent(
+      '${card.name} ${card.number} ${card.setName}',
+    );
+    return Uri.parse('https://www.ebay.com/sch/i.html?_nkw=$q');
+  }
+
+  Uri _ebaySoldUrl() {
+    final q = Uri.encodeComponent(
+      '${card.name} ${card.number} ${card.setName}',
+    );
+    return Uri.parse(
+      'https://www.ebay.com/sch/i.html?_nkw=$q&LH_Sold=1&LH_Complete=1',
+    );
+  }
+
+  Future<void> _openExternal(BuildContext context, Uri uri) async {
+    final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!ok && context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Could not open eBay')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.06),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: accentColor.withOpacity(0.18)),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                accentColor.withOpacity(0.12),
+                Colors.white.withOpacity(0.03),
+              ],
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'eBay Market',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: _MiniPriceTile(
+                      label: 'Tracked',
+                      value: _money(card.marketValue ?? card.bestMarket),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _MiniPriceTile(
+                      label: 'Set',
+                      value: card.setName.isEmpty ? '-' : card.setName,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Text(
+                'Glance at recent eBay pricing without leaving the app.',
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.76),
+                  fontWeight: FontWeight.w600,
+                  height: 1.35,
+                ),
+              ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: ElevatedButton.icon(
+                  onPressed: () => _openExternal(context, _ebaySearchUrl()),
+                  icon: const Icon(Icons.shopping_bag_outlined),
+                  label: const Text('View active listings on eBay'),
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: OutlinedButton.icon(
+                  onPressed: () => _openExternal(context, _ebaySoldUrl()),
+                  icon: const Icon(Icons.query_stats),
+                  label: const Text('View sold listings on eBay'),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        EbayListingPreviewSection(
+          query: ebayQuery,
+          accentColor: accentColor,
+          title: 'Inline eBay Preview',
+        ),
+      ],
+    );
+  }
+}
+
+class _CardDetailBackdrop extends StatelessWidget {
+  final Color accentColor;
+
+  const _CardDetailBackdrop({required this.accentColor});
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Stack(
+        children: [
+          Container(color: const Color(0xFF071018)),
+          Positioned(
+            top: -120,
+            right: -40,
+            child: Container(
+              width: 300,
+              height: 300,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: RadialGradient(
+                  colors: [
+                    accentColor.withOpacity(0.22),
+                    accentColor.withOpacity(0.0),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            left: -80,
+            top: 180,
+            child: Container(
+              width: 220,
+              height: 220,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: RadialGradient(
+                  colors: [Colors.white.withOpacity(0.06), Colors.transparent],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MiniPriceTile extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _MiniPriceTile({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.06)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.68),
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -2022,51 +8443,51 @@ class ConditionGuideScreen extends StatelessWidget {
   const ConditionGuideScreen({super.key, required this.initialGrade});
 
   String _label(int g) {
-    if (g >= 10) return "Gem Mint (PSA 10)";
-    if (g == 9) return "Mint (PSA 9)";
-    if (g == 8) return "Near Mint–Mint (PSA 8)";
-    if (g == 7) return "Near Mint (PSA 7)";
-    if (g == 6) return "Excellent–Mint (PSA 6)";
-    if (g == 5) return "Excellent (PSA 5)";
-    if (g == 4) return "Very Good–Excellent (PSA 4)";
-    if (g == 3) return "Very Good (PSA 3)";
-    if (g == 2) return "Good (PSA 2)";
-    return "Poor (PSA 1)";
+    if (g >= 10) return 'Gem Mint (PSA 10)';
+    if (g == 9) return 'Mint (PSA 9)';
+    if (g == 8) return 'Near Mint-Mint (PSA 8)';
+    if (g == 7) return 'Near Mint (PSA 7)';
+    if (g == 6) return 'Excellent-Mint (PSA 6)';
+    if (g == 5) return 'Excellent (PSA 5)';
+    if (g == 4) return 'Very Good-Excellent (PSA 4)';
+    if (g == 3) return 'Very Good (PSA 3)';
+    if (g == 2) return 'Good (PSA 2)';
+    return 'Poor (PSA 1)';
   }
 
   String _desc(int g) {
-    if (g >= 10) return "Perfect corners, edges, surface, and centering.";
-    if (g == 9) return "Almost flawless, tiny imperfections.";
-    if (g == 8) return "Minor whitening or surface wear.";
-    if (g == 7) return "Noticeable whitening, minor scratches/print lines.";
+    if (g >= 10) return 'Perfect corners, edges, surface, and centering.';
+    if (g == 9) return 'Almost flawless, tiny imperfections.';
+    if (g == 8) return 'Minor whitening or surface wear.';
+    if (g == 7) return 'Noticeable whitening, minor scratches/print lines.';
     if (g == 6)
-      return "Moderate wear, small crease possible, still presentable.";
+      return 'Moderate wear, small crease possible, still presentable.';
     if (g == 5)
-      return "Clear wear, whitening, surface scratches, possible small crease.";
-    if (g == 4) return "Heavy wear, corner rounding, surface damage.";
+      return 'Clear wear, whitening, surface scratches, possible small crease.';
+    if (g == 4) return 'Heavy wear, corner rounding, surface damage.';
     if (g == 3)
-      return "Major wear, creases, edge chipping, strong surface issues.";
-    if (g == 2) return "Severe wear/damage, multiple creases.";
-    return "Very damaged (tears, heavy creasing, ink, etc.).";
+      return 'Major wear, creases, edge chipping, strong surface issues.';
+    if (g == 2) return 'Severe wear/damage, multiple creases.';
+    return 'Very damaged (tears, heavy creasing, ink, etc.).';
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Grading Guide")),
+      appBar: AppBar(title: const Text('Grading Guide')),
       body: ListView.separated(
         padding: const EdgeInsets.all(16),
         itemCount: 10,
         separatorBuilder: (_, __) => const SizedBox(height: 10),
         itemBuilder: (context, i) {
           final g = 10 - i;
-          final selected = g == initialGrade;
-
           return Card(
             child: ListTile(
-              title: Text("Grade $g • ${_label(g)}"),
+              title: Text('Grade $g - ${_label(g)}'),
               subtitle: Text(_desc(g)),
-              trailing: selected ? const Icon(Icons.check_circle) : null,
+              trailing: g == initialGrade
+                  ? const Icon(Icons.check_circle)
+                  : null,
             ),
           );
         },
@@ -2080,7 +8501,7 @@ class ConditionGuideScreen extends StatelessWidget {
 class RecognizingScreen extends StatefulWidget {
   final String photoPath;
 
-  /// If provided, this scan is "slot-locked" (Pokédex flow)
+  /// If provided, this scan is "slot-locked" (PokÃ©dex flow)
   final String? expectedSetId;
   final int? expectedSlot;
 
@@ -2132,7 +8553,53 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
     return cardSet == expectedSetId && cardNum == expectedSlot;
   }
 
+  Future<PokemonCardResult> _cardWithMarketValue(PokemonCardResult card) async {
+    if (card.marketValue != null) return card;
+
+    final query = buildEbayQuery(
+      name: card.name,
+      setName: card.setName,
+      number: card.number,
+      printedTotal: card.setPrintedTotal,
+      mode: EbayMode.raw,
+    );
+
+    final marketValue = await fetchEbayMarketValue(query: query);
+    if (marketValue == null) return card;
+    return card.copyWith(marketValue: marketValue);
+  }
+
+  Future<void> _enrichSavedCardMarketValue(PokemonCardResult card) async {
+    if (card.marketValue != null) return;
+
+    final enrichedCard = await _cardWithMarketValue(card);
+    final marketValue = enrichedCard.marketValue;
+    if (marketValue == null) return;
+
+    collectionStore.updateCardMarketValueIfMissing(
+      cardId: card.id,
+      marketValue: marketValue,
+    );
+  }
+
   bool _hasLetters(String s) => RegExp(r'[A-Za-z]').hasMatch(s);
+
+  String _normalizeOcrCollectorNumber(String raw) {
+    var s = raw.toUpperCase().trim();
+    s = s.replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+    final promoMatch = RegExp(r'^(SVP|SWSH)([0-9]{1,3})$').firstMatch(s);
+    if (promoMatch != null) {
+      return '${promoMatch.group(1)}${promoMatch.group(2)}';
+    }
+
+    final suffixDigits = RegExp(r'([0-9]{1,4})$').firstMatch(s);
+    if (suffixDigits != null) {
+      return suffixDigits.group(1)!;
+    }
+
+    return '';
+  }
 
   String _flattenRaw(String raw) {
     return raw
@@ -2143,7 +8610,7 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
 
   ({String num, String total})? _extractCollectorFraction(String flat) {
     final m = RegExp(
-      r'(?<!\d)(\d{1,4})\s*[/\|\-–—]\s*(\d{2,4})(?!\d)',
+      r'(?<!\d)(\d{1,4})\s*[/\|\-â€“â€”]\s*(\d{2,4})(?!\d)',
     ).firstMatch(flat);
     if (m == null) return null;
 
@@ -2181,23 +8648,28 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
       String? numOnly;
       String setTotalStr = (guess.setTotal ?? '').trim();
 
-      // Prefer OCR-provided number first
       if (rawNumber.isNotEmpty) {
         if (rawNumber.contains('/')) {
           final parts = rawNumber.split('/');
-          numOnly = parts.first.trim();
+          final normalized = _normalizeOcrCollectorNumber(parts.first.trim());
+          numOnly = normalized.isEmpty ? null : normalized;
           if (setTotalStr.isEmpty && parts.length > 1) {
             setTotalStr = parts[1].trim();
           }
         } else {
-          numOnly = rawNumber.trim();
+          final normalized = _normalizeOcrCollectorNumber(rawNumber.trim());
+          numOnly = normalized.isEmpty ? null : normalized;
         }
       }
+
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [parsed-number] raw="$rawNumber" normalized="${numOnly ?? ''}"',
+      );
 
       if (numOnly != null && numOnly!.trim().isEmpty) numOnly = null;
       if (setTotalStr.trim().isEmpty) setTotalStr = '';
 
-      // Prefer explicit collector fraction from raw (e.g., 245/198)
       final frac = flat.isNotEmpty ? _extractCollectorFraction(flat) : null;
       if (frac != null) {
         final current = (numOnly ?? '').trim();
@@ -2212,8 +8684,6 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
 
       // ---------- SVP PROMO DETECTION ----------
       final svpDigitsFromNumber = PokemonOcr.extractSvpNumberFromRaw(rawText);
-      // This method must exist in pokemon_ocr.dart. If you haven't added it yet,
-      // temporarily change the next line to: `final int? svpDigitsFromSignature = null;`
       final svpDigitsFromSignature = PokemonOcr.detectSvpSlotBySignature(
         rawText,
       );
@@ -2221,19 +8691,18 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
 
       // ignore: avoid_print
       print(
-        '🧷 SVP DEBUG → fromNumber=$svpDigitsFromNumber fromSignature=$svpDigitsFromSignature chosen=$svpDigits',
+        'ðŸ§· SVP DEBUG â†’ fromNumber=$svpDigitsFromNumber fromSignature=$svpDigitsFromSignature chosen=$svpDigits',
       );
 
       final bool isSvpDetected = svpDigits != null;
       final bool isSvpFlow = widget.expectedSetId == 'svp' || isSvpDetected;
 
       if (isSvpFlow && svpDigits != null) {
-        numOnly = 'SVP$svpDigits'; // -> cleaned later in API to "SVP51"
+        numOnly = 'SVP$svpDigits';
         if (setTotalStr.isEmpty) setTotalStr = '102';
       }
 
       // ---------- PROMO CODE GUARD (non-SVP) ----------
-      // Drop alphanumeric numbers (like SWSH105) unless SVP flow.
       if (!isSvpFlow && numOnly != null && _hasLetters(numOnly!)) {
         numOnly = null;
       }
@@ -2248,45 +8717,121 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
           ? widget.expectedSetId!.trim()
           : null;
 
-      // IMPORTANT:
-      // If slot-locked, do NOT pass expectedSlot into the worker search.
-      // We validate exact slot AFTER we get a best match back.
+      // IMPORTANT: If slot-locked, don't pass expectedSlot into worker search.
       final int? expectedSlot = isSlotLocked ? null : widget.expectedSlot;
 
       // ignore: avoid_print
       print(
-        '🔍 OCR DEBUG → name=$usedName, number=$numOnly, setTotal=${setTotalStr.isEmpty ? "null" : setTotalStr}, hp=$hp, expectedSetId=$expectedSetId, expectedSlot=$expectedSlot, svpDigits=$svpDigits',
+        'SCAN DEBUG [ocr] rawName="$rawName" usedName="$usedName" '
+        'stage="${guess.stage ?? ''}" rawNumber="$rawNumber" '
+        'parsedNumber="${numOnly ?? ''}" '
+        'setTotal=${setTotalStr.isEmpty ? "null" : setTotalStr} '
+        'hp=${hp ?? 'null'} expectedSetId="${expectedSetId ?? ''}" '
+        'expectedSlot=${expectedSlot ?? 'null'} svpDigits=${svpDigits ?? 'null'}',
       );
+
+      if (usedName.trim().isEmpty && (numOnly == null || numOnly!.isEmpty)) {
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [ocr-empty] no usable name/number; proceeding with raw-text fallback lookup',
+        );
+      }
 
       // ---------- SEARCH ----------
       final api = PokemonTcgApi();
       final pick = await api.searchCardsReliable(
         name: usedName,
         number: numOnly,
+        numberSource: guess.numberSource,
+        imagePath: widget.photoPath,
         setTotal: setTotalStr,
         hp: hp,
+        rawText: rawText,
         expectedSetId: expectedSetId,
         expectedSlot: expectedSlot,
         svpSlot: svpDigits,
+      );
+
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [recognizer-pick] strategy="${pick.strategy}" '
+        'best="${pick.best?.name ?? ''}" '
+        'bestNumber="${pick.best?.number ?? ''}" '
+        'bestSet="${pick.best?.setName ?? ''}" '
+        'candidateCount=${pick.candidates.length}',
       );
 
       if (!mounted) return;
 
       // ---------- BEST MATCH ----------
       if (pick.best != null) {
-        if (!_matchesExpected(pick.best!)) {
-          await _showWrongCardDialog(pick.best!);
+        final card = pick.best!;
+
+        if (!_matchesExpected(card)) {
+          await _showWrongCardDialog(card);
           return;
         }
 
+        // Slot-locked flow (PokÃ©dex)
+        if (isSlotLocked) {
+          if (!_hasPersistentCollectionAccess(
+            FirebaseAuth.instance.currentUser,
+          )) {
+            await _showAccountRequiredToSavePrompt(context);
+            return;
+          }
+
+          final cardToSave = card;
+
+          collectionStore.addCard(cardToSave);
+          unawaited(_enrichSavedCardMarketValue(cardToSave));
+          collectionStore.emitCollected(
+            CollectedEvent(
+              setKey: widget.expectedSetId!,
+              slot: widget.expectedSlot!,
+              cardName: cardToSave.name,
+              imageUrl: cardToSave.imageLarge.isNotEmpty
+                  ? cardToSave.imageLarge
+                  : cardToSave.imageSmall,
+            ),
+          );
+
+          if (!mounted) return;
+
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => PokedexRegisterAnimationScreen(
+                card: cardToSave,
+                setKey: widget.expectedSetId!,
+                slot: widget.expectedSlot!,
+              ),
+            ),
+          );
+          return;
+        }
+
+        // Non-slot-locked: prevent duplicates
+        final already = collectionStore.containsCardId(card.id);
+        if (already) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Already in your collection.')),
+          );
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => OwnedCardShowcaseScreen(card: card),
+            ),
+          );
+          return;
+        }
+
+        // Non-slot-locked: go to clean confirm screen (no pricing/toggle)
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
-            builder: (_) => PokemonCardDetailsScreen(
-              card: pick.best!,
-              expectedSetId: widget.expectedSetId,
-              expectedSlot: widget.expectedSlot,
-            ),
+            builder: (_) =>
+                PokemonCardDetailsScreen(card: card, compactAddMode: true),
           ),
         );
         return;
@@ -2306,10 +8851,11 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         name: usedName,
         number: numOnly,
         prefetched: pick.candidates,
+        scannerFallback: true,
       );
     } catch (e, st) {
       // ignore: avoid_print
-      print('❌ Recognizing failed: $e');
+      print('âŒ Recognizing failed: $e');
       // ignore: avoid_print
       print(st);
 
@@ -2326,6 +8872,7 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
     required String name,
     String? number,
     List<PokemonCardResult>? prefetched,
+    bool scannerFallback = false,
   }) {
     final hasSomething =
         name.trim().isNotEmpty || (number != null && number.trim().isNotEmpty);
@@ -2342,13 +8889,14 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
       context,
       MaterialPageRoute(
         builder: (_) => SearchResultsScreen(
-          type: CardType.pokemon,
           name: name.trim(),
           set: null,
           number: (number != null && number.trim().isNotEmpty)
               ? number.trim()
               : null,
           prefetched: prefetched,
+          browseOnly: false,
+          scannerFallback: scannerFallback,
         ),
       ),
     );
@@ -2399,7 +8947,7 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Recognizing…')),
+      appBar: AppBar(title: const Text('Recognizing...')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: _loading
@@ -2409,7 +8957,7 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
                   children: [
                     CircularProgressIndicator(),
                     SizedBox(height: 12),
-                    Text('Reading card text…'),
+                    Text('Reading card text...'),
                   ],
                 ),
               )
@@ -2487,7 +9035,7 @@ Future<void> showPokedexRegistered(
       final number =
           slot ?? int.tryParse(card.number.replaceAll(RegExp(r'[^0-9]'), ''));
       final subtitle =
-          setNameOverride ?? (card.setName.isNotEmpty ? card.setName : '—');
+          setNameOverride ?? (card.setName.isNotEmpty ? card.setName : '-');
 
       return SafeArea(
         child: Center(
@@ -2564,7 +9112,7 @@ Future<void> showPokedexRegistered(
                             Text(
                               number == null
                                   ? subtitle
-                                  : '$subtitle • #$number',
+                                  : '$subtitle - #$number',
                               style: TextStyle(
                                 color: Colors.white.withOpacity(0.78),
                                 fontWeight: FontWeight.w600,
@@ -2595,4 +9143,176 @@ Future<void> showPokedexRegistered(
       );
     },
   );
+}
+
+class AnimatedBackground extends StatefulWidget {
+  const AnimatedBackground({super.key});
+
+  @override
+  State<AnimatedBackground> createState() => _AnimatedBackgroundState();
+}
+
+class _AnimatedBackgroundState extends State<AnimatedBackground>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  late final Animation<double> _t;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(seconds: 10))
+      ..repeat(reverse: true);
+
+    _t = CurvedAnimation(parent: _c, curve: Curves.easeInOut);
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _t,
+      builder: (context, _) {
+        final a = Alignment.lerp(
+          const Alignment(-0.8, -0.6),
+          const Alignment(0.9, 0.8),
+          _t.value,
+        )!;
+        final b = Alignment.lerp(
+          const Alignment(0.9, -0.8),
+          const Alignment(-0.8, 0.9),
+          _t.value,
+        )!;
+
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: a,
+              end: b,
+              colors: const [
+                Color(0xFF071622),
+                Color(0xFF062B33),
+                Color(0xFF040B12),
+              ],
+              stops: const [0.0, 0.55, 1.0],
+            ),
+          ),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: RadialGradient(
+                center: Alignment.lerp(
+                  const Alignment(-0.2, -0.4),
+                  const Alignment(0.6, 0.5),
+                  _t.value,
+                )!,
+                radius: 1.2,
+                colors: const [Color(0x2200E5FF), Color(0x00000000)],
+                stops: const [0.0, 1.0],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class FloatingFeaturedCardBg extends StatefulWidget {
+  final String imageUrl;
+  const FloatingFeaturedCardBg({super.key, required this.imageUrl});
+
+  @override
+  State<FloatingFeaturedCardBg> createState() => _FloatingFeaturedCardBgState();
+}
+
+class _FloatingFeaturedCardBgState extends State<FloatingFeaturedCardBg>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(seconds: 8))
+      ..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _c,
+      builder: (context, _) {
+        final t = Curves.easeInOut.transform(_c.value);
+
+        final dy = lerpDouble(-10, 14, t)!;
+        final rot = lerpDouble(-0.08, 0.06, t)!; // radians
+        final scale = lerpDouble(1.02, 1.06, t)!;
+
+        return IgnorePointer(
+          child: Opacity(
+            opacity: 0.14, // pushed back more (was 0.22)
+            child: Transform.translate(
+              offset: Offset(0, dy),
+              child: Transform.rotate(
+                angle: rot,
+                child: Transform.scale(
+                  scale: scale,
+                  child: Align(
+                    alignment: const Alignment(0.75, -0.65), // moved up/left
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(22),
+                      child: Stack(
+                        children: [
+                          Image.network(
+                            widget.imageUrl,
+                            width: 260,
+                            fit: BoxFit.cover,
+                            filterQuality: FilterQuality.high,
+                          ),
+
+                          // Blur it so it becomes â€œartâ€, not readable text
+                          Positioned.fill(
+                            child: BackdropFilter(
+                              filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                              child: const SizedBox(),
+                            ),
+                          ),
+
+                          // Darken it slightly so UI stays dominant
+                          Positioned.fill(
+                            child: Container(
+                              color: Colors.black.withOpacity(0.35),
+                            ),
+                          ),
+
+                          // Soft highlight edge for premium feel
+                          Positioned.fill(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                border: Border.all(color: Colors.white24),
+                                borderRadius: BorderRadius.circular(22),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
 }

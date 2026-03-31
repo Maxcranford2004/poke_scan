@@ -1,10 +1,14 @@
+import 'dart:io';
 import 'dart:math';
+import 'package:image/image.dart' as img;
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:path_provider/path_provider.dart';
 
 class OcrGuess {
   final String? name;
   final String? number; // numerator only, e.g. "65"
   final String? setTotal; // denominator, e.g. "202"
+  final String? numberSource; // "main", "bottom_left", "bottom_broad"
   final int? hp;
   final String? stage; // "Basic", "Stage 1", "Stage 2"
   final String rawText;
@@ -18,6 +22,7 @@ class OcrGuess {
     required this.name,
     required this.number,
     required this.setTotal,
+    this.numberSource,
     required this.hp,
     required this.stage,
     required this.rawText,
@@ -140,6 +145,93 @@ class PokemonOcr {
         .where((w) => w.isNotEmpty)
         .toList();
     return tokens.any(_stopWords.contains);
+  }
+
+  static bool _looksWeakNameCandidate(String s) {
+    final cleaned = _cleanLineLetters(s).trim();
+    if (cleaned.length < 3) return true;
+
+    final lower = cleaned.toLowerCase();
+    if (_looksLikeNonNameLine(lower) || _hasStopWordToken(lower)) return true;
+
+    final lettersOnly = cleaned.replaceAll(RegExp(r"[^A-Za-z']"), '');
+    if (lettersOnly.length < 3) return true;
+
+    final internalCaps = RegExp(r'[A-Z]').allMatches(cleaned.substring(1)).length;
+    if (!cleaned.contains(' ') && internalCaps >= 2) return true;
+
+    if (!cleaned.contains(' ') &&
+        cleaned.length >= 9 &&
+        RegExp(r'[a-z][A-Z]$').hasMatch(cleaned)) {
+      return true;
+    }
+
+    final vowelCount = RegExp(
+      r'[aeiouy]',
+      caseSensitive: false,
+    ).allMatches(lettersOnly).length;
+    if (vowelCount == 0) return true;
+
+    return false;
+  }
+
+  static bool _hasPokemonTitleMarker(String cleanedLower) {
+    return cleanedLower.startsWith('mega ') ||
+        cleanedLower.endsWith(' ex') ||
+        cleanedLower.endsWith(' gx') ||
+        cleanedLower.endsWith(' vmax') ||
+        cleanedLower.endsWith(' vstar') ||
+        cleanedLower.endsWith(' v');
+  }
+
+  static bool _looksLikeAttackLineCandidate({
+    required String cleaned,
+    required String rawLine,
+    required double yNorm,
+  }) {
+    final lower = cleaned.toLowerCase().trim();
+    if (lower.isEmpty) return true;
+
+    final sourceLower = _deaccent(rawLine).toLowerCase();
+    final tokens = lower.split(RegExp(r'\s+')).where((t) => t.isNotEmpty).toList();
+    final hasMarker = _hasPokemonTitleMarker(lower);
+
+    if (RegExp(r'\d').hasMatch(rawLine)) {
+      return true;
+    }
+
+    if (sourceLower.contains('ritorne') ||
+        sourceLower.contains('neve') ||
+        sourceLower.contains('rancor') ||
+        sourceLower.contains('assoluta')) {
+      return true;
+    }
+
+    if (sourceLower.contains('this attack') ||
+        sourceLower.contains('your opponent') ||
+        sourceLower.contains('active pokemon') ||
+        sourceLower.contains('benched pokemon') ||
+        sourceLower.contains('flip a coin') ||
+        sourceLower.contains('attach ') ||
+        sourceLower.contains('discard ') ||
+        sourceLower.contains('draw ') ||
+        sourceLower.contains('search ') ||
+        sourceLower.contains('energy')) {
+      return true;
+    }
+
+    if (yNorm > 0.25) {
+      return true;
+    }
+
+    if (yNorm > 0.18 &&
+        tokens.length >= 2 &&
+        tokens.length <= 3 &&
+        !hasMarker) {
+      return true;
+    }
+
+    return false;
   }
 
   // ---------- Candidate scoring ----------
@@ -485,6 +577,23 @@ class PokemonOcr {
       '',
     );
 
+    t = t.replaceAll(
+      RegExp(r'\s*(?:HP\s*)?\d{2,4}\s*$', caseSensitive: false),
+      '',
+    );
+
+    // preserve Mega names, including glued OCR forms like "MegaFroslass ex"
+    t = t.replaceAllMapped(
+      RegExp(r"^(mega)\s*([A-Za-z][A-Za-z'\- ]{2,30})$", caseSensitive: false),
+      (m) => 'Mega ${m.group(2)!.trim()}',
+    );
+
+    // salvage noisy top-title OCR like "Megrosksek" -> "Mega rosksek"
+    t = t.replaceAllMapped(
+      RegExp(r'^(meg)([A-Za-z]{4,30})$', caseSensitive: false),
+      (m) => 'Mega ${m.group(2)!.trim()}',
+    );
+
     // fix common OCR: "Gardevoirek" / "Gardevoirex" -> "Gardevoir ex"
     t = t.replaceAllMapped(
       RegExp(r"^([A-Za-z][A-Za-z'\- ]{2,30})\s*e[kx]\b", caseSensitive: false),
@@ -526,6 +635,31 @@ class PokemonOcr {
     return t.trim();
   }
 
+  static String? _salvageTopTitleCandidate(String raw) {
+    var t = _deaccent(raw).replaceAll('\n', ' ').trim();
+    if (t.isEmpty) return null;
+
+    t = t.replaceAll(
+      RegExp(r'\b(?:HP\s*)?\d{2,4}\b', caseSensitive: false),
+      ' ',
+    );
+    t = t.replaceAll(RegExp(r"[^A-Za-z\s'\-]"), ' ');
+    t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (t.isEmpty) return null;
+
+    final normalized = _normalizePickedName(t);
+    if (normalized.isEmpty) return null;
+
+    final lower = normalized.toLowerCase();
+    final looksMegaStyle = lower.startsWith('mega ');
+    if (lower == 'mega') return null;
+
+    if (!_looksWeakNameCandidate(normalized) || looksMegaStyle) {
+      return normalized;
+    }
+    return null;
+  }
+
   // ---------- Name extraction ----------
   static String? _extractNameNearHp(String raw) {
     final t = _deaccent(raw).replaceAll('\n', ' ');
@@ -543,7 +677,7 @@ class PokemonOcr {
     if (name == null || name.isEmpty) return null;
 
     name = _normalizePickedName(name);
-    if (name.isEmpty) return null;
+    if (name.isEmpty || _looksWeakNameCandidate(name)) return null;
 
     return name;
   }
@@ -603,19 +737,360 @@ class PokemonOcr {
     return picked;
   }
 
+  static List<_LineBox> _topTitleStripLineBoxes(List<_LineBox> lineBoxes) {
+    if (lineBoxes.isEmpty) return const <_LineBox>[];
+
+    final minTop = lineBoxes.first.top;
+    final maxTop = lineBoxes.last.top;
+    final span = (maxTop - minTop).abs();
+    final topStripCutoff = minTop + (span * 0.18);
+
+    return lineBoxes
+        .where((lb) => span <= 0 || lb.top <= topStripCutoff)
+        .take(24)
+        .toList();
+  }
+
+  static String _rawTextFromLineBoxes(List<_LineBox> lineBoxes) {
+    return lineBoxes.map((lb) => lb.text.trim()).where((s) => s.isNotEmpty).join('\n');
+  }
+
+  static Future<String?> _writeTopTitleCrop(String path) async {
+    try {
+      final bytes = await File(path).readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+
+      final cropHeight = max(1, (decoded.height * 0.24).round());
+      final cropped = img.copyCrop(
+        decoded,
+        x: 0,
+        y: 0,
+        width: decoded.width,
+        height: cropHeight,
+      );
+
+      final tempDir = await getTemporaryDirectory();
+      final outFile = File(
+        '${tempDir.path}/poke_scan_title_${DateTime.now().microsecondsSinceEpoch}.png',
+      );
+      await outFile.writeAsBytes(img.encodePng(cropped), flush: true);
+      return outFile.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<String?> _writeBottomCollectorCrop(String path) async {
+    try {
+      final bytes = await File(path).readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+
+      final cropHeight = max(1, (decoded.height * 0.24).round());
+      final cropY = max(0, decoded.height - cropHeight);
+      final cropWidth = max(1, (decoded.width * 0.86).round());
+
+      final cropped = img.copyCrop(
+        decoded,
+        x: 0,
+        y: cropY,
+        width: cropWidth,
+        height: cropHeight,
+      );
+
+      final tempDir = await getTemporaryDirectory();
+      final outFile = File(
+        '${tempDir.path}/poke_scan_bottom_${DateTime.now().microsecondsSinceEpoch}.png',
+      );
+      await outFile.writeAsBytes(img.encodePng(cropped), flush: true);
+      return outFile.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<String?> _writeBottomLeftCollectorCrop(String path) async {
+    try {
+      final bytes = await File(path).readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+
+      final cropHeight = max(1, (decoded.height * 0.14).round());
+      final cropY = max(
+        0,
+        decoded.height - cropHeight - (decoded.height * 0.01).round(),
+      );
+      final cropWidth = max(1, (decoded.width * 0.38).round());
+
+      final cropped = img.copyCrop(
+        decoded,
+        x: 0,
+        y: cropY,
+        width: cropWidth,
+        height: cropHeight,
+      );
+
+      final tempDir = await getTemporaryDirectory();
+      final outFile = File(
+        '${tempDir.path}/poke_scan_bottom_left_${DateTime.now().microsecondsSinceEpoch}.png',
+      );
+      await outFile.writeAsBytes(img.encodePng(cropped), flush: true);
+      return outFile.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static String _normalizeBottomCollectorText(String s) {
+    var t = _deaccent(s).toUpperCase();
+    t = t.replaceAllMapped(RegExp(r'([0-9])O'), (m) => '${m.group(1)}0');
+    t = t.replaceAllMapped(RegExp(r'O([0-9])'), (m) => '0${m.group(1)}');
+    t = t.replaceAll(RegExp(r'[^A-Z0-9/\s]'), ' ');
+    t = t.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return t;
+  }
+
+  static String _cleanBottomCollectorToken(String token) {
+    var t = token.toUpperCase().replaceAll(RegExp(r'\s+'), '');
+    t = t.replaceAllMapped(RegExp(r'([0-9])O'), (m) => '${m.group(1)}0');
+    t = t.replaceAllMapped(RegExp(r'O([0-9])'), (m) => '0${m.group(1)}');
+    return t;
+  }
+
+  static bool _looksSuspiciousCollectorFraction(String? number, String? total) {
+    final n = int.tryParse((number ?? '').replaceAll(RegExp(r'[^0-9]'), ''));
+    final t = int.tryParse((total ?? '').replaceAll(RegExp(r'[^0-9]'), ''));
+    if (n == null || t == null) return false;
+    return n > t && (n - t) > 50;
+  }
+
+  static Future<Map<String, String?>> extractBottomCollectorFraction(
+    InputImage image,
+  ) async {
+    final path = image.filePath;
+    if (path == null || path.isEmpty) {
+      return {'number': null, 'setTotal': null};
+    }
+
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    try {
+      return _extractBottomCollectorFractionFromPath(path, recognizer);
+    } finally {
+      await recognizer.close();
+    }
+  }
+
+  static Future<Map<String, String?>> _extractBottomCollectorFractionFromPath(
+    String path,
+    TextRecognizer recognizer,
+  ) async {
+    String? cropPath;
+    try {
+      cropPath = await _writeBottomCollectorCrop(path);
+      if (cropPath == null) {
+        return {'number': null, 'setTotal': null};
+      }
+
+      final pass = await _recognizeStructuredText(recognizer, cropPath);
+      final sources = <String>[
+        pass.raw,
+        ...pass.lineBoxes.map((lb) => lb.text),
+      ];
+
+      final fractionPattern = RegExp(
+        r'\b([A-Z]{0,5}\s*[0-9O]{1,4})\s*[/|]\s*([A-Z]{0,5}\s*[0-9O]{2,4})\b',
+      );
+      final promoPattern = RegExp(
+        r'\b((?:SVP|SWSH)\s*[0-9O]{1,3})\b',
+      );
+      print('OCR BOTTOM RAW >>> ${pass.raw.replaceAll('\n', ' | ')}');
+
+      for (final source in sources) {
+        final normalized = _normalizeBottomCollectorText(source);
+        if (normalized.isEmpty) continue;
+        final compact = normalized.replaceAll(' ', '');
+
+        for (final candidate in [normalized, compact]) {
+          final fractionMatch = fractionPattern.firstMatch(candidate);
+          if (fractionMatch != null) {
+            final left = _cleanBottomCollectorToken(fractionMatch.group(1)!);
+            final right = _cleanBottomCollectorToken(fractionMatch.group(2)!);
+            if (left.isNotEmpty && right.isNotEmpty) {
+              return {'number': left, 'setTotal': right};
+            }
+          }
+        }
+
+        final promoMatch = promoPattern.firstMatch(normalized);
+        if (promoMatch != null) {
+          final token = _cleanBottomCollectorToken(promoMatch.group(1)!);
+          if (token.isNotEmpty) {
+            return {'number': token, 'setTotal': null};
+          }
+        }
+      }
+    } finally {
+      if (cropPath != null) {
+        try {
+          await File(cropPath).delete();
+        } catch (_) {}
+      }
+    }
+
+    return {'number': null, 'setTotal': null};
+  }
+
+  static Future<Map<String, String?>> _extractBottomLeftCollectorFractionFromPath(
+    String path,
+    TextRecognizer recognizer,
+  ) async {
+    String? cropPath;
+    try {
+      cropPath = await _writeBottomLeftCollectorCrop(path);
+      if (cropPath == null) {
+        return {'number': null, 'setTotal': null};
+      }
+
+      final pass = await _recognizeStructuredText(recognizer, cropPath);
+      final sources = <String>[
+        pass.raw,
+        ...pass.lineBoxes.map((lb) => lb.text),
+      ];
+
+      final fractionPattern = RegExp(
+        r'\b([A-Z]{0,5}\s*[0-9O]{1,4})\s*[/|]\s*([A-Z]{0,5}\s*[0-9O]{2,4})\b',
+      );
+      final promoPattern = RegExp(
+        r'\b((?:SVP|SWSH)\s*[0-9O]{1,3})\b',
+      );
+      print('OCR BOTTOM LEFT RAW >>> ${pass.raw.replaceAll('\n', ' | ')}');
+
+      for (final source in sources) {
+        final normalized = _normalizeBottomCollectorText(source);
+        if (normalized.isEmpty) continue;
+        final compact = normalized.replaceAll(' ', '');
+
+        for (final candidate in [normalized, compact]) {
+          final fractionMatch = fractionPattern.firstMatch(candidate);
+          if (fractionMatch != null) {
+            final left = _cleanBottomCollectorToken(fractionMatch.group(1)!);
+            final right = _cleanBottomCollectorToken(fractionMatch.group(2)!);
+            if (left.isNotEmpty && right.isNotEmpty) {
+              return {'number': left, 'setTotal': right};
+            }
+          }
+        }
+
+        final promoMatch = promoPattern.firstMatch(normalized);
+        if (promoMatch != null) {
+          final token = _cleanBottomCollectorToken(promoMatch.group(1)!);
+          if (token.isNotEmpty) {
+            return {'number': token, 'setTotal': null};
+          }
+        }
+      }
+    } finally {
+      if (cropPath != null) {
+        try {
+          await File(cropPath).delete();
+        } catch (_) {}
+      }
+    }
+
+    return {'number': null, 'setTotal': null};
+  }
+
+  static Future<({String raw, List<_LineBox> lineBoxes})> _recognizeStructuredText(
+    TextRecognizer recognizer,
+    String path,
+  ) async {
+    final input = InputImage.fromFilePath(path);
+    final recognized = await recognizer.processImage(input);
+    final raw = recognized.text.trim();
+
+    final lineBoxes = <_LineBox>[];
+    for (final block in recognized.blocks) {
+      for (final line in block.lines) {
+        final txt = line.text.trim();
+        if (txt.isEmpty) continue;
+        final bb = line.boundingBox;
+        lineBoxes.add(
+          _LineBox(
+            text: txt,
+            top: bb.top.toDouble(),
+            left: bb.left.toDouble(),
+            height: bb.height.toDouble(),
+          ),
+        );
+      }
+    }
+
+    lineBoxes.sort((a, b) {
+      final c = a.top.compareTo(b.top);
+      return c != 0 ? c : a.left.compareTo(b.left);
+    });
+
+    return (raw: raw, lineBoxes: lineBoxes);
+  }
+
+  static String? _extractNameFromTopBand(List<_LineBox> lineBoxes) {
+    if (lineBoxes.isEmpty) return null;
+
+    final minTop = lineBoxes.first.top;
+    final maxTop = lineBoxes.last.top;
+    final span = (maxTop - minTop).abs();
+    final topBandCutoff = minTop + (span * 0.18);
+
+    final candidates = <({String name, int score})>[];
+
+    for (var i = 0; i < min(36, lineBoxes.length); i++) {
+      final lb = lineBoxes[i];
+      if (span > 0 && lb.top > topBandCutoff) continue;
+
+      final picked = _extractNameFromRawLine(lb.text);
+      if (picked == null || picked.isEmpty) continue;
+      if (_looksWeakNameCandidate(picked)) continue;
+
+      final lower = picked.toLowerCase();
+      if (_looksLikeNonNameLine(lower)) continue;
+      if (_looksLikeAttackLineCandidate(
+        cleaned: picked,
+        rawLine: lb.text,
+        yNorm: 0.0,
+      )) {
+        continue;
+      }
+
+      var score = 0;
+      score += (lb.height * 2.0).clamp(0, 38).round();
+      score += (22 - i).clamp(0, 22);
+      score += _hasPokemonTitleMarker(lower) ? 10 : 0;
+      score += lower.startsWith('mega ') ? 10 : 0;
+      score += lower.endsWith(' ex') ? 8 : 0;
+
+      candidates.add((name: picked, score: score));
+    }
+
+    if (candidates.isEmpty) return null;
+    candidates.sort((a, b) => b.score.compareTo(a.score));
+    return candidates.first.name;
+  }
+
   static String? _extractNameFromTopArea(List<_LineBox> lineBoxes) {
     if (lineBoxes.isEmpty) return null;
 
     final minTop = lineBoxes.first.top;
     final maxTop = lineBoxes.last.top;
     final span = (maxTop - minTop).abs();
-    final topCutoff = minTop + (span * 0.70);
+    final topCutoff = minTop + (span * 0.34);
 
     final candidates = <({String name, int score})>[];
 
     void considerLine(_LineBox lb, int i) {
       final picked = _extractNameFromRawLine(lb.text);
       if (picked == null || picked.isEmpty) return;
+      if (_looksWeakNameCandidate(picked)) return;
 
       final lower = picked.toLowerCase();
       if (_looksLikeNonNameLine(lower)) return;
@@ -635,12 +1110,22 @@ class PokemonOcr {
         yNorm = y < 0 ? 0.0 : (y > 1 ? 1.0 : y);
       }
 
+      if (_looksLikeAttackLineCandidate(
+        cleaned: picked,
+        rawLine: lb.text,
+        yNorm: yNorm,
+      )) {
+        return;
+      }
+
       final sc = _scoreNameCandidate(
         cleaned: picked,
         index: i,
         lineHeight: lb.height,
         yNorm: yNorm,
-      );
+      ) +
+          (lower.startsWith('mega ') ? 8 : 0) +
+          (lower.endsWith(' ex') ? 6 : 0);
 
       if (sc > -200) {
         candidates.add((name: picked, score: sc));
@@ -657,7 +1142,9 @@ class PokemonOcr {
     // pass 2: fallback
     if (candidates.isEmpty) {
       for (var i = 0; i < min(140, lineBoxes.length); i++) {
-        considerLine(lineBoxes[i], i);
+        final lb = lineBoxes[i];
+        if (span > 0 && lb.top > (minTop + (span * 0.52))) continue;
+        considerLine(lb, i);
       }
     }
 
@@ -694,46 +1181,130 @@ class PokemonOcr {
   // ---------- Main ----------
   static Future<OcrGuess> recognizeFromImagePath(String path) async {
     final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    String? topCropPath;
     try {
-      final input = InputImage.fromFilePath(path);
-      final recognized = await recognizer.processImage(input);
-      final raw = recognized.text.trim();
+      topCropPath = await _writeTopTitleCrop(path);
+      final topPass = topCropPath == null
+          ? null
+          : await _recognizeStructuredText(recognizer, topCropPath);
+      final fullPass = await _recognizeStructuredText(recognizer, path);
+      final raw = fullPass.raw;
+      final lineBoxes = fullPass.lineBoxes;
 
-      final lineBoxes = <_LineBox>[];
-      for (final block in recognized.blocks) {
-        for (final line in block.lines) {
-          final txt = line.text.trim();
-          if (txt.isEmpty) continue;
-          final bb = line.boundingBox;
-          lineBoxes.add(
-            _LineBox(
-              text: txt,
-              top: bb.top.toDouble(),
-              left: bb.left.toDouble(),
-              height: bb.height.toDouble(),
-            ),
-          );
-        }
-      }
-
-      // stable ordering: top->bottom then left->right
-      lineBoxes.sort((a, b) {
-        final c = a.top.compareTo(b.top);
-        return c != 0 ? c : a.left.compareTo(b.left);
-      });
-
+      final topTitleLines = _topTitleStripLineBoxes(lineBoxes);
+      final topTitleRaw = topPass?.raw.isNotEmpty == true
+          ? topPass!.raw
+          : _rawTextFromLineBoxes(topTitleLines);
+      final topPassPreview = (topPass?.lineBoxes ?? topTitleLines)
+          .take(8)
+          .map((lb) => lb.text.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
       final frac = _pickBestCollectorFraction(lineBoxes, raw);
+      final shouldTryBottomFallback =
+          frac.number == null || frac.setTotal == null;
+      final bottomLeftFrac = shouldTryBottomFallback
+          ? await _extractBottomLeftCollectorFractionFromPath(path, recognizer)
+          : const <String, String?>{'number': null, 'setTotal': null};
+      final bottomFrac = shouldTryBottomFallback
+          ? await _extractBottomCollectorFractionFromPath(path, recognizer)
+          : const <String, String?>{'number': null, 'setTotal': null};
+      final broadLooksSuspicious = _looksSuspiciousCollectorFraction(
+        bottomFrac['number'],
+        bottomFrac['setTotal'],
+      );
+
+      String? resolvedNumber = frac.number;
+      String? resolvedSetTotal = frac.setTotal;
+      var fractionSource = 'main';
+
+      if (resolvedNumber == null && resolvedSetTotal == null) {
+        if (bottomLeftFrac['number'] != null) {
+          resolvedNumber = bottomLeftFrac['number'];
+          resolvedSetTotal = bottomLeftFrac['setTotal'];
+          fractionSource = 'bottom_left';
+        } else {
+          resolvedNumber = bottomFrac['number'];
+          resolvedSetTotal = bottomFrac['setTotal'];
+          if (resolvedNumber != null || resolvedSetTotal != null) {
+            fractionSource = 'bottom_broad';
+          }
+        }
+      } else if (broadLooksSuspicious && bottomLeftFrac['number'] != null) {
+        resolvedNumber = bottomLeftFrac['number'];
+        resolvedSetTotal = bottomLeftFrac['setTotal'];
+        fractionSource = 'bottom_left';
+      }
       final hp = _extractHp(raw);
       final stage = _extractStage(raw);
       print('🧾 FRACTION DEBUG → ${frac.number}/${frac.setTotal}');
 
-      String? best = _extractNameNearHp(raw);
-      best ??= _extractNameFromTopArea(lineBoxes);
+      if (bottomLeftFrac['number'] != null || bottomLeftFrac['setTotal'] != null) {
+        print(
+          'OCR BOTTOM LEFT FRACTION >>> number=${bottomLeftFrac['number']} total=${bottomLeftFrac['setTotal']}',
+        );
+      }
+      if (bottomFrac['number'] != null || bottomFrac['setTotal'] != null) {
+        print(
+          'OCR BOTTOM FRACTION >>> number=${bottomFrac['number']} total=${bottomFrac['setTotal']}',
+        );
+      }
+      print(
+        'OCR FRACTION RESOLVED >>> number=$resolvedNumber total=$resolvedSetTotal source=$fractionSource',
+      );
+      print('OCR TOP CROP RAW >>> $topTitleRaw');
+      print('OCR TOP CROP LINES >>> ${topPassPreview.join(' | ')}');
+      final topStripName = topTitleRaw.isEmpty
+          ? null
+          : (_extractNameNearHp(topTitleRaw) ??
+                _salvageTopTitleCandidate(topTitleRaw));
+      final topBandName = _extractNameFromTopBand(
+        topPass?.lineBoxes.isNotEmpty == true
+            ? topPass!.lineBoxes
+            : (topTitleLines.isNotEmpty ? topTitleLines : lineBoxes),
+      );
+      final topName = _extractNameFromTopArea(lineBoxes);
+      final hpName = _extractNameNearHp(raw);
+      print(
+        'OCR TOP PICK >>> topStripName=${topStripName ?? "null"} topBandName=${topBandName ?? "null"}',
+      );
+
+      String? best;
+      final normalizedTopStrip = topStripName == null || topStripName.isEmpty
+          ? ''
+          : _normalizePickedName(topStripName);
+      final normalizedTopStripLower = normalizedTopStrip.toLowerCase();
+      final hasUsableTopStrip = normalizedTopStrip.isNotEmpty;
+      final strongTopStrip =
+          hasUsableTopStrip &&
+          (!_looksWeakNameCandidate(normalizedTopStrip) ||
+              normalizedTopStripLower.contains('froslass'));
+
+      if (strongTopStrip) {
+        best = normalizedTopStrip;
+      } else if (hasUsableTopStrip) {
+        best = normalizedTopStrip;
+      } else if (topBandName != null && !_looksWeakNameCandidate(topBandName)) {
+        best = topBandName;
+      } else if (topName != null && !_looksWeakNameCandidate(topName)) {
+        best = topName;
+      } else if (hpName != null && !_looksWeakNameCandidate(hpName)) {
+        best = hpName;
+      } else {
+        best = topBandName ?? topName ?? hpName;
+      }
 
       // final cleanup (handles your glued "SrAGIPGardevoirek" case)
       if (best != null && best.isNotEmpty) {
         final cleaned = _normalizePickedName(best);
-        if (cleaned.isNotEmpty) best = cleaned;
+        if (cleaned.isNotEmpty &&
+            (!_looksWeakNameCandidate(cleaned) ||
+                cleaned.toLowerCase().contains('froslass') ||
+                (hasUsableTopStrip && cleaned == normalizedTopStrip))) {
+          best = cleaned;
+        } else {
+          best = null;
+        }
       }
 
       if (debug) {
@@ -767,8 +1338,9 @@ class PokemonOcr {
 
       return OcrGuess(
         name: best,
-        number: frac.number,
-        setTotal: frac.setTotal,
+        number: resolvedNumber,
+        setTotal: resolvedSetTotal,
+        numberSource: fractionSource,
         hp: hp,
         stage: stage,
         rawText: raw,
@@ -777,6 +1349,11 @@ class PokemonOcr {
         copyrightYear: _extractCopyrightYear(raw),
       );
     } finally {
+      if (topCropPath != null) {
+        try {
+          await File(topCropPath).delete();
+        } catch (_) {}
+      }
       await recognizer.close();
     }
   }

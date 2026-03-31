@@ -53,6 +53,57 @@ extension PokemonCardResultPreview on PokemonCardResult {
   }
 }
 
+enum CardHitType {
+  normal,
+  holo,
+  ultra,
+  illustration,
+  secret,
+  promo,
+}
+
+CardHitType classifyCard(PokemonCardResult card) {
+  final rarity = (card.rarity ?? '').toLowerCase().trim();
+  final numberDigits = card.number.replaceAll(RegExp(r'[^0-9]'), '');
+  final number = numberDigits.isEmpty ? null : int.tryParse(numberDigits);
+  final total = card.setPrintedTotal;
+  final setId = card.setId.toLowerCase();
+  final cardNumber = card.number.toLowerCase();
+
+  // PROMO
+  if (setId.contains('promo') || cardNumber.contains('svp')) {
+    return CardHitType.promo;
+  }
+
+  // SECRET TIER (MOST IMPORTANT RULE)
+  // Any card beyond set size is a "hit"
+  if (number != null && total != null && number > total) {
+    // Distinguish illustration vs generic secret
+    if (rarity.contains('illustration')) {
+      return CardHitType.illustration;
+    }
+    return CardHitType.secret;
+  }
+
+  // ILLUSTRATION (non-secret cases, safety fallback)
+  if (rarity.contains('special illustration rare') ||
+      rarity.contains('illustration rare')) {
+    return CardHitType.illustration;
+  }
+
+  // ULTRA (modern EX / GX / V full arts typically fall here)
+  if (rarity.contains('ultra rare')) {
+    return CardHitType.ultra;
+  }
+
+  // HOLO / REVERSE HOLO
+  if (rarity.contains('holo')) {
+    return CardHitType.holo;
+  }
+
+  return CardHitType.normal;
+}
+
 class PokemonCardResult {
   final String id;
   final String name;
@@ -67,6 +118,7 @@ class PokemonCardResult {
 
   // Disambiguators
   final int? hp;
+  final String? rarity;
   final String? supertype;
   final List<String> subtypes;
 
@@ -75,6 +127,7 @@ class PokemonCardResult {
   final String imageLarge;
 
   // Pricing/link
+  final double? marketValue;
   final String? tcgplayerUrl;
   final Map<String, PriceRow> finishes;
 
@@ -87,9 +140,11 @@ class PokemonCardResult {
     required this.imageSmall,
     required this.imageLarge,
     required this.finishes,
+    this.marketValue,
     this.tcgplayerUrl,
     this.setPrintedTotal,
     this.hp,
+    this.rarity,
     this.supertype,
     List<String>? subtypes,
   }) : subtypes = subtypes ?? const [];
@@ -100,6 +155,26 @@ class PokemonCardResult {
     imageSmall: imageSmall,
     imageLarge: imageLarge,
   );
+
+  PokemonCardResult copyWith({double? marketValue}) {
+    return PokemonCardResult(
+      id: id,
+      name: name,
+      setName: setName,
+      setId: setId,
+      setPrintedTotal: setPrintedTotal,
+      number: number,
+      hp: hp,
+      rarity: rarity,
+      supertype: supertype,
+      subtypes: subtypes,
+      imageSmall: imageSmall,
+      imageLarge: imageLarge,
+      marketValue: marketValue ?? this.marketValue,
+      tcgplayerUrl: tcgplayerUrl,
+      finishes: finishes,
+    );
+  }
 
   double? get bestMarket {
     const preferred = [
@@ -126,12 +201,19 @@ class PokemonCardResult {
       subtypes.any((s) => s.toLowerCase().replaceAll(' ', '') == 'stage1');
   bool get isStage2 =>
       subtypes.any((s) => s.toLowerCase().replaceAll(' ', '') == 'stage2');
+  CardHitType get hitType => classifyCard(this);
 
   factory PokemonCardResult.fromJson(Map<String, dynamic> json) {
     int? i(dynamic v) {
       if (v == null) return null;
       if (v is int) return v;
       return int.tryParse(v.toString());
+    }
+
+    double? d(dynamic v) {
+      if (v == null) return null;
+      if (v is num) return v.toDouble();
+      return double.tryParse(v.toString());
     }
 
     List<String> listString(dynamic v) {
@@ -171,10 +253,16 @@ class PokemonCardResult {
       }
     }
 
+    final setJson = (json['set'] as Map<String, dynamic>?) ?? const {};
+    final printedTotalRaw = setJson['printedTotal'];
+
     // set info: flattened OR nested
     String setName = (json['setName'] ?? json['set_name'] ?? '').toString();
     String setId = (json['setId'] ?? json['set_id'] ?? '').toString();
-    int? setPrintedTotal = i(json['setPrintedTotal'] ?? json['printed_total']);
+    int? setPrintedTotal = printedTotalRaw is int
+        ? printedTotalRaw
+        : int.tryParse(printedTotalRaw?.toString() ?? '');
+    setPrintedTotal ??= i(json['setPrintedTotal'] ?? json['printed_total']);
 
     final setObj = json['set'];
     if (setObj is Map) {
@@ -208,13 +296,18 @@ class PokemonCardResult {
       name: (json['name'] ?? '').toString(),
       setName: setName,
       setId: setId,
-      setPrintedTotal: setPrintedTotal,
+      setPrintedTotal: printedTotalRaw is int
+          ? printedTotalRaw
+          : int.tryParse(printedTotalRaw?.toString() ?? '') ??
+                setPrintedTotal,
       number: (json['number'] ?? '').toString(),
       hp: i(json['hp']),
+      rarity: json['rarity']?.toString(),
       supertype: json['supertype']?.toString(),
       subtypes: listString(json['subtypes']),
       imageSmall: imageSmall,
       imageLarge: imageLarge,
+      marketValue: d(json['marketValue']),
       tcgplayerUrl: tcgplayerUrl,
       finishes: finishes,
     );
@@ -229,10 +322,12 @@ class PokemonCardResult {
       'setPrintedTotal': setPrintedTotal,
       'number': number,
       'hp': hp,
+      'rarity': rarity,
       'supertype': supertype,
       'subtypes': subtypes,
       'imageSmall': imageSmall,
       'imageLarge': imageLarge,
+      'marketValue': marketValue,
       'tcgplayerUrl': tcgplayerUrl,
       'finishes': finishes.map((k, v) => MapEntry(k, v.toJson())),
     };

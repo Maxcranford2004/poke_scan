@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1076429937427",
+    "project_id": "poke-scan-2748e",
+    "storage_bucket": "poke-scan-2748e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1076429937427:android:673a58bb7ca87755ed58e6",
+        "android_client_info": {
+          "package_name": "com.example.poke_scan"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCcAF9yrydRzYrHUtwLHeVn0YO2kY8D5fo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
