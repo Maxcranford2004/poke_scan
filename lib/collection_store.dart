@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
@@ -279,6 +280,8 @@ class CollectionStore extends ChangeNotifier {
   bool _marketValueRefreshInProgress = false;
   bool _persistentCollectionAccessEnabled = false;
   bool _sessionAccessInitialized = false;
+  String? _activeUserId;
+  int _authGeneration = 0;
   MarketValueQueryBuilder? _marketValueQueryBuilder;
   MarketValueFetcher? _marketValueFetcher;
 
@@ -307,11 +310,11 @@ class CollectionStore extends ChangeNotifier {
 
   Future<void> initProfile() async {
     final box = await Hive.openBox(_profileBoxName);
-    _totalXp = (box.get('totalXp') as int?) ?? 0;
-    _streak = (box.get('streak') as int?) ?? 0;
-    _lastScanYmd = box.get('lastScanYmd') as String?;
-    _totalScans = (box.get('totalScans') as int?) ?? 0;
-    final rawUnlocked = box.get(_unlockedAchievementsKey);
+    _totalXp = (box.get(_profileScopedKey('totalXp')) as int?) ?? 0;
+    _streak = (box.get(_profileScopedKey('streak')) as int?) ?? 0;
+    _lastScanYmd = box.get(_profileScopedKey('lastScanYmd')) as String?;
+    _totalScans = (box.get(_profileScopedKey('totalScans')) as int?) ?? 0;
+    final rawUnlocked = box.get(_profileScopedKey(_unlockedAchievementsKey));
     _unlockedAchievements
       ..clear()
       ..addAll(
@@ -322,6 +325,37 @@ class CollectionStore extends ChangeNotifier {
 
     await _loadCollectionCache();
     await _checkAndUnlockAchievements();
+  }
+
+  Future<void> handleAuthUserChanged(User? user) async {
+    final oldUid = _activeUserId;
+    final newUid = user?.uid;
+    final enabled = user != null && !user.isAnonymous;
+
+    debugPrint('COLLECTION AUTH SWITCH >>> oldUid=$oldUid newUid=$newUid');
+
+    if (_sessionAccessInitialized &&
+        oldUid == newUid &&
+        _persistentCollectionAccessEnabled == enabled) {
+      return;
+    }
+
+    _sessionAccessInitialized = true;
+    _activeUserId = newUid;
+    _authGeneration += 1;
+    _persistentCollectionAccessEnabled = enabled;
+
+    _resetActiveState();
+    _bumpCollectionViewVersion();
+    notifyListeners();
+
+    if (!enabled) {
+      return;
+    }
+
+    await initProfile();
+    unawaited(syncFromFirestore());
+    notifyListeners();
   }
 
   Future<void> setPersistentCollectionAccessEnabled(bool enabled) async {
@@ -348,12 +382,12 @@ class CollectionStore extends ChangeNotifier {
   Future<void> _saveProfile() async {
     if (!_persistentCollectionAccessEnabled) return;
     final box = await Hive.openBox(_profileBoxName);
-    await box.put('totalXp', _totalXp);
-    await box.put('streak', _streak);
-    await box.put('lastScanYmd', _lastScanYmd);
-    await box.put('totalScans', _totalScans);
+    await box.put(_profileScopedKey('totalXp'), _totalXp);
+    await box.put(_profileScopedKey('streak'), _streak);
+    await box.put(_profileScopedKey('lastScanYmd'), _lastScanYmd);
+    await box.put(_profileScopedKey('totalScans'), _totalScans);
     await box.put(
-      _unlockedAchievementsKey,
+      _profileScopedKey(_unlockedAchievementsKey),
       _unlockedAchievements.toList(growable: false),
     );
   }
@@ -452,7 +486,7 @@ class CollectionStore extends ChangeNotifier {
 
     try {
       final box = await Hive.openBox(_collectionBoxName);
-      final rawEntries = box.get(_collectionEntriesKey);
+      final rawEntries = box.get(_collectionEntriesScopedKey);
 
       _entries
         ..clear()
@@ -473,7 +507,7 @@ class CollectionStore extends ChangeNotifier {
     try {
       final box = await Hive.openBox(_collectionBoxName);
       final data = _entries.map((e) => e.toJson()).toList(growable: false);
-      await box.put(_collectionEntriesKey, data);
+      await box.put(_collectionEntriesScopedKey, data);
     } catch (e, st) {
       debugPrint('CollectionStore local collection save failed: $e');
       debugPrintStack(stackTrace: st);
@@ -581,6 +615,8 @@ class CollectionStore extends ChangeNotifier {
       return;
     }
 
+    final syncGeneration = _authGeneration;
+    final syncUid = _activeUserId;
     _cloudSyncInProgress = true;
     _bumpProfileViewVersion();
     notifyListeners();
@@ -588,6 +624,10 @@ class CollectionStore extends ChangeNotifier {
 
     try {
       final remoteCards = await _firestoreCollectionService.fetchOwnedCards();
+      if (syncGeneration != _authGeneration || syncUid != _activeUserId) {
+        debugPrint('CollectionStore Firestore fetch discarded after auth switch');
+        return;
+      }
       final mergeResult = _mergeFirestoreRecords(remoteCards);
 
       if (mergeResult.changed) {
@@ -608,6 +648,9 @@ class CollectionStore extends ChangeNotifier {
       debugPrint('CollectionStore Firestore fetch failed: $e');
       debugPrintStack(stackTrace: st);
     } finally {
+      if (syncGeneration != _authGeneration || syncUid != _activeUserId) {
+        return;
+      }
       _cloudSyncInProgress = false;
       _cloudSyncComplete = true;
       _bumpProfileViewVersion();
@@ -884,6 +927,17 @@ class CollectionStore extends ChangeNotifier {
   Map<int, PreviewCard> getPreviewSlotMapForSet(String setKey) {
     final map = _setIndex[setKey];
     if (map == null || map.isEmpty) return <int, PreviewCard>{};
+
+    final out = <int, PreviewCard>{};
+    map.forEach((slot, card) {
+      out[slot] = card.toPreview();
+    });
+    return out;
+  }
+
+  Map<int, PreviewCard> previewSlotMapViewForSet(String setKey) {
+    final map = _setIndex[setKey];
+    if (map == null || map.isEmpty) return const <int, PreviewCard>{};
 
     final out = <int, PreviewCard>{};
     map.forEach((slot, card) {
@@ -1255,7 +1309,19 @@ class CollectionStore extends ChangeNotifier {
     );
   }
 
-  void _applyGuestBlankSlate() {
+  String _profileScopedKey(String key) {
+    final uid = _activeUserId?.trim();
+    if (uid == null || uid.isEmpty) return key;
+    return '$key|$uid';
+  }
+
+  String get _collectionEntriesScopedKey {
+    final uid = _activeUserId?.trim();
+    if (uid == null || uid.isEmpty) return _collectionEntriesKey;
+    return '$_collectionEntriesKey|$uid';
+  }
+
+  void _resetActiveState() {
     _entries.clear();
     _totalXp = 0;
     _streak = 0;
@@ -1269,6 +1335,11 @@ class CollectionStore extends ChangeNotifier {
     lastAchievementEvent.value = null;
     lastPokedexEvent.value = null;
     lastCollected.value = null;
+    _invalidateCollectionDerivedCaches();
+  }
+
+  void _applyGuestBlankSlate() {
+    _resetActiveState();
     _bumpCollectionViewVersion();
     notifyListeners();
   }

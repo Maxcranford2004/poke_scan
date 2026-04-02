@@ -1165,12 +1165,30 @@ class EbayListingPreviewSection extends StatelessWidget {
     );
   }
 
+  Uri _ebaySoldUrl() {
+    return Uri.parse(
+      'https://www.ebay.com/sch/i.html?_nkw=${Uri.encodeComponent(query)}&LH_Sold=1&LH_Complete=1',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<List<EbayPreviewItem>>(
       future: fetchEbayPreviewItems(query: query, maxListings: maxListings),
       builder: (context, snap) {
         final items = snap.data ?? const <EbayPreviewItem>[];
+        final hasActiveItems = items.any(
+          (item) => item.state == EbayListingState.active,
+        );
+        final hasSoldItems = items.any(
+          (item) => item.state == EbayListingState.sold,
+        );
+        final browseUrl = (!hasActiveItems && hasSoldItems)
+            ? _ebaySoldUrl()
+            : _ebaySearchUrl();
+        final browseLabel = (!hasActiveItems && hasSoldItems)
+            ? 'View sold listings on eBay'
+            : 'View more on eBay';
 
         return Container(
           padding: const EdgeInsets.all(16),
@@ -1241,9 +1259,9 @@ class EbayListingPreviewSection extends StatelessWidget {
                 width: double.infinity,
                 height: 50,
                 child: OutlinedButton.icon(
-                  onPressed: () => _openExternal(_ebaySearchUrl().toString()),
+                  onPressed: () => _openExternal(browseUrl.toString()),
                   icon: const Icon(Icons.open_in_new),
-                  label: const Text('View more on eBay'),
+                  label: Text(browseLabel),
                 ),
               ),
             ],

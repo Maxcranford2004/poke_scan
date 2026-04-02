@@ -1511,6 +1511,213 @@ class PokemonTcgApi {
         parsedTotal == null;
   }
 
+  String _normalizeManualFallbackQuery(String raw) {
+    final cleaned = _cleanName(raw).toLowerCase();
+    if (cleaned.isEmpty) return '';
+
+    const noise = {'pokemon', 'card', 'tcg'};
+    const formTokens = {
+      'ex',
+      'gx',
+      'v',
+      'vmax',
+      'vstar',
+      'break',
+      'radiant',
+      'tag',
+      'team',
+    };
+
+    final tokens = cleaned
+        .split(RegExp(r'\s+'))
+        .map((t) => t.trim())
+        .where((t) => t.isNotEmpty && !noise.contains(t))
+        .toList();
+    if (tokens.isEmpty) return cleaned;
+
+    final speciesTokens = tokens
+        .where((t) => t != 'mega' && !formTokens.contains(t))
+        .toList();
+
+    final out = <String>[];
+    if (tokens.contains('mega')) out.add('mega');
+    out.addAll(speciesTokens);
+    if (out.isEmpty) out.addAll(tokens);
+    return out.join(' ').trim();
+  }
+
+  List<String> _buildManualFallbackQueries(String raw) {
+    final safe = _cleanName(raw);
+    final normalized = _normalizeManualFallbackQuery(raw);
+    final speciesCore = _scannerCoreSpeciesName(raw);
+    final megaLike = _scannerLooksMegaLike(raw);
+
+    final queries = <String>[];
+    final seen = <String>{};
+
+    void addQuery(String q) {
+      final cleaned = _cleanName(q);
+      if (cleaned.isEmpty) return;
+      final key = cleaned.toLowerCase();
+      if (seen.add(key)) {
+        queries.add(cleaned);
+      }
+    }
+
+    addQuery(safe);
+    addQuery(normalized);
+    if (speciesCore.isNotEmpty) {
+      if (megaLike) addQuery('Mega $speciesCore');
+      addQuery(speciesCore);
+    }
+
+    return queries;
+  }
+
+  int _manualSearchRelevanceScore(String query, PokemonCardResult card) {
+    final normalizedQuery = _normalizeManualFallbackQuery(query);
+    final normalizedName = _normalizeScannerName(card.name);
+    if (normalizedQuery.isEmpty || normalizedName.isEmpty) return 0;
+
+    final queryTokens = normalizedQuery
+        .split(RegExp(r'\s+'))
+        .where((t) => t.isNotEmpty)
+        .toList();
+    final speciesTokens = _scannerCoreSpeciesName(query)
+        .split(RegExp(r'\s+'))
+        .where((t) => t.isNotEmpty)
+        .toList();
+
+    var score = 0;
+    if (normalizedName == normalizedQuery) score += 80;
+
+    final wantsMega = queryTokens.contains('mega');
+    final candidateIsMega =
+        normalizedName.contains('mega') ||
+        normalizedName.split(' ').contains('m');
+    if (wantsMega && candidateIsMega) {
+      score += 20;
+    } else if (wantsMega && !candidateIsMega) {
+      score -= 8;
+    }
+
+    for (final token in speciesTokens) {
+      if (normalizedName.contains(token)) {
+        score += 35;
+      }
+    }
+
+    for (final token in queryTokens) {
+      if (token == 'mega') continue;
+      if (normalizedName.contains(token)) {
+        score += 12;
+      }
+    }
+
+    if (speciesTokens.isNotEmpty &&
+        speciesTokens.every((token) => normalizedName.contains(token))) {
+      score += 30;
+    }
+
+    return score;
+  }
+
+  List<PokemonCardResult> _sortManualSearchResults(
+    List<PokemonCardResult> cards,
+    String query,
+  ) {
+    final sorted = List<PokemonCardResult>.from(cards);
+    sorted.sort((a, b) {
+      final byScore = _manualSearchRelevanceScore(query, b).compareTo(
+        _manualSearchRelevanceScore(query, a),
+      );
+      if (byScore != 0) return byScore;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return sorted;
+  }
+
+  int _manualSearchTopScore(String query, List<PokemonCardResult> cards) {
+    if (cards.isEmpty) return 0;
+    var best = 0;
+    for (final card in cards) {
+      final score = _manualSearchRelevanceScore(query, card);
+      if (score > best) best = score;
+    }
+    return best;
+  }
+
+  Future<List<PokemonCardResult>> _runManualSearchAttempt({
+    required String name,
+    String? set,
+    String? number,
+    String? setTotal,
+    bool directOnly = false,
+    int pageSize = 20,
+  }) async {
+    final safeName = _cleanName(name);
+    final cleanNum = _cleanCollectorNumber(number);
+    final normalizedSet = (set ?? '').trim().isEmpty ? null : (set ?? '').trim();
+    final normalizedTotal = _parseSetTotal(setTotal)?.toString() ?? setTotal;
+
+    if (!directOnly) {
+      if (_shouldTryWorkerManualSearch(
+        name: safeName,
+        set: normalizedSet,
+        number: cleanNum,
+        setTotal: normalizedTotal,
+      )) {
+        try {
+          final workerResults = await _tryWorkerManualSearch(
+            name: safeName,
+            set: normalizedSet,
+            number: cleanNum,
+            setTotal: normalizedTotal,
+            pageSize: pageSize,
+          );
+          if (workerResults.isNotEmpty) {
+            return _sortManualSearchResults(workerResults, safeName);
+          }
+        } catch (e) {
+          // ignore: avoid_print
+          print('worker manual search failed: $e');
+        }
+      }
+
+      if (_isBroadNameOnlyManualSearch(
+        name: safeName,
+        number: cleanNum,
+        setTotal: normalizedTotal,
+      )) {
+        try {
+          final workerBrowseResults = await _tryWorkerBrowseSearch(
+            name: safeName,
+            set: normalizedSet,
+            pageSize: pageSize,
+          );
+          if (workerBrowseResults.isNotEmpty) {
+            return _sortManualSearchResults(workerBrowseResults, safeName);
+          }
+        } catch (e) {
+          // ignore: avoid_print
+          print('worker browse search failed: $e');
+        }
+      }
+    }
+
+    final directResults = await _refreshSearchDirect(
+      name: name,
+      set: set,
+      number: number,
+      setTotal: setTotal,
+      pageSize: pageSize,
+    );
+    if (directResults.isNotEmpty) {
+      return _sortManualSearchResults(directResults, safeName);
+    }
+    return const <PokemonCardResult>[];
+  }
+
   Future<List<PokemonCardResult>> _tryWorkerManualSearch({
     required String name,
     String? set,
@@ -1799,55 +2006,90 @@ class PokemonTcgApi {
     final hasNumber = cleanNum != null && cleanNum.isNotEmpty;
     if (!hasName && !hasNumber) return <PokemonCardResult>[];
 
-    final normalizedSet = safeSet.isEmpty ? null : safeSet;
-    final normalizedTotal = printedTotal?.toString() ?? setTotal;
-
-    if (_shouldTryWorkerManualSearch(
-      name: safeName,
-      set: normalizedSet,
-      number: cleanNum,
-      setTotal: normalizedTotal,
-    )) {
-      try {
-        final workerResults = await _tryWorkerManualSearch(
-          name: safeName,
-          set: normalizedSet,
+    if (hasNumber) {
+      final fallbackQueries = _buildManualFallbackQueries(safeName);
+      for (final query in fallbackQueries) {
+        final results = await _runManualSearchAttempt(
+          name: query,
+          set: safeSet.isEmpty ? null : safeSet,
           number: cleanNum,
-          setTotal: normalizedTotal,
+          setTotal: printedTotal?.toString() ?? setTotal,
           pageSize: pageSize,
         );
-        if (workerResults.isNotEmpty) return workerResults;
-      } catch (e) {
-        // ignore: avoid_print
-        print('worker manual search failed: $e');
+        if (results.isNotEmpty) return results;
+      }
+      return const <PokemonCardResult>[];
+    }
+
+    final fallbackQueries = _buildManualFallbackQueries(safeName);
+    final speciesCore = _scannerCoreSpeciesName(safeName);
+    final safeTokens = safeName
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((t) => t.isNotEmpty)
+        .toList();
+    final isSingleTokenCoreSearch =
+        safeTokens.length == 1 &&
+        speciesCore.isNotEmpty &&
+        speciesCore == safeTokens.first;
+
+    final attempts = <({String query, bool directOnly})>[];
+    final seenAttempts = <String>{};
+
+    void addAttempt(String query, {required bool directOnly}) {
+      final cleaned = _cleanName(query);
+      if (cleaned.isEmpty) return;
+      final key = '${cleaned.toLowerCase()}|$directOnly';
+      if (seenAttempts.add(key)) {
+        attempts.add((query: cleaned, directOnly: directOnly));
       }
     }
 
-    if (_isBroadNameOnlyManualSearch(
-      name: safeName,
-      number: cleanNum,
-      setTotal: normalizedTotal,
-    )) {
-      try {
-        final workerBrowseResults = await _tryWorkerBrowseSearch(
-          name: safeName,
-          set: normalizedSet,
-          pageSize: pageSize,
-        );
-        if (workerBrowseResults.isNotEmpty) return workerBrowseResults;
-      } catch (e) {
-        // ignore: avoid_print
-        print('worker browse search failed: $e');
+    for (var i = 0; i < fallbackQueries.length; i++) {
+      final query = fallbackQueries[i];
+      addAttempt(query, directOnly: false);
+      if (i == 0 && isSingleTokenCoreSearch) {
+        addAttempt(query, directOnly: true);
       }
     }
 
-    return _refreshSearchDirect(
-      name: name,
-      set: set,
-      number: number,
-      setTotal: setTotal,
-      pageSize: pageSize,
-    );
+    List<PokemonCardResult> bestResults = const <PokemonCardResult>[];
+    String? bestQuery;
+    var bestScore = 0;
+
+    for (final attempt in attempts) {
+      final results = await _runManualSearchAttempt(
+        name: attempt.query,
+        set: safeSet.isEmpty ? null : safeSet,
+        number: cleanNum,
+        setTotal: printedTotal?.toString() ?? setTotal,
+        directOnly: attempt.directOnly,
+        pageSize: pageSize,
+      );
+      final topScore = _manualSearchTopScore(attempt.query, results);
+      // ignore: avoid_print
+      print(
+        'TRACE manualSearch.attempt query="${attempt.query}" count=${results.length} topScore=$topScore',
+      );
+
+      if (results.isEmpty) continue;
+      if (bestQuery == null || topScore > bestScore) {
+        bestResults = results;
+        bestQuery = attempt.query;
+        bestScore = topScore;
+      }
+      if (topScore >= 50) break;
+    }
+
+    if (bestQuery != null && bestResults.isNotEmpty) {
+      // ignore: avoid_print
+      print(
+        'TRACE manualSearch.selected query="$bestQuery" count=${bestResults.length} topScore=$bestScore',
+      );
+      return bestResults;
+    }
+
+    return const <PokemonCardResult>[];
   }
   // ------------------- Card by ID -------------------
 

@@ -529,9 +529,7 @@ Future<void> main() async {
   await Hive.initFlutter();
 
   await PokemonTcgApi.initCache();
-  await collectionStore.setPersistentCollectionAccessEnabled(
-    _hasPersistentCollectionAccess(FirebaseAuth.instance.currentUser),
-  );
+  await collectionStore.handleAuthUserChanged(FirebaseAuth.instance.currentUser);
 
   final api = PokemonTcgApi();
   unawaited(api.debugHealthCheck());
@@ -638,11 +636,7 @@ class _AppShellState extends State<AppShell> {
   void initState() {
     super.initState();
     _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
-      unawaited(
-        collectionStore.setPersistentCollectionAccessEnabled(
-          _hasPersistentCollectionAccess(user),
-        ),
-      );
+      unawaited(collectionStore.handleAuthUserChanged(user));
     });
   }
 
@@ -704,6 +698,89 @@ class ProfileScreen extends StatelessWidget {
       initialData: FirebaseAuth.instance.currentUser,
       builder: (context, authSnapshot) {
         final user = authSnapshot.data;
+        if (user == null || user.isAnonymous) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('Trainer Profile')),
+            body: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 460),
+                  child: Container(
+                    padding: const EdgeInsets.all(24),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(28),
+                      gradient: const LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [Color(0xFF17325B), Color(0xFF0D1629)],
+                      ),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 72,
+                          height: 72,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.white.withOpacity(0.10),
+                            border: Border.all(
+                              color: Colors.white.withOpacity(0.14),
+                            ),
+                          ),
+                          child: const Icon(
+                            Icons.lock_outline_rounded,
+                            size: 34,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        const Text(
+                          'Profile locked',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 28,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'Create an account to save your collection, track streaks, earn achievements, and sync across devices.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            height: 1.4,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white.withOpacity(0.78),
+                          ),
+                        ),
+                        const SizedBox(height: 22),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 52,
+                          child: FilledButton(
+                            onPressed: () => _startCreateAccountFlow(context),
+                            child: const Text('Create account'),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 52,
+                          child: OutlinedButton(
+                            onPressed: () => _startSignInFlow(context),
+                            child: const Text('Sign in'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
         return AnimatedBuilder(
           animation: collectionStore.profileViewVersion,
           builder: (context, _) {
@@ -4289,7 +4366,11 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
         _results = live;
         _loading = false;
         _updating = false;
-        _error = live.isEmpty ? 'No results found.' : null;
+        _error = live.isEmpty
+            ? (widget.browseOnly
+                  ? 'Try adding the card number for a more exact match.'
+                  : 'No results found.')
+            : null;
       });
       // ignore: avoid_print
       print(
@@ -4572,6 +4653,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
   Timer? _searchDebounce;
   String _query = '';
   List<SetSummary> _allSets = const <SetSummary>[];
+  List<SetSummary> _visibleSets = const <SetSummary>[];
   List<_CollectionSearchHit> _searchHits = const <_CollectionSearchHit>[];
   List<_OwnedSearchCandidate> _searchSource = const <_OwnedSearchCandidate>[];
 
@@ -4579,6 +4661,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
   void initState() {
     super.initState();
     _allSets = collectionStore.getSetSummariesView();
+    _visibleSets = _allSets;
     _searchSource = _buildOwnedSearchSource(_allSets);
     collectionStore.collectionViewVersion.addListener(_onCollectionChanged);
     _searchCtrl.addListener(_onSearchChanged);
@@ -4602,6 +4685,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
     if (!mounted) return;
     setState(() {
       _allSets = summaries;
+      _visibleSets = _filterSetSummaries(summaries, _query);
       _searchSource = source;
       _searchHits = nextHits;
     });
@@ -4616,6 +4700,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
     if (nextQuery.isEmpty) {
       setState(() {
         _query = '';
+        _visibleSets = _allSets;
         _searchHits = const <_CollectionSearchHit>[];
       });
       return;
@@ -4626,7 +4711,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
     _searchDebounce = Timer(const Duration(milliseconds: 60), () {
       final hits = _buildCollectionSearchHits(_searchSource, nextQuery);
       if (!mounted || nextQuery != _query) return;
-      setState(() => _searchHits = hits);
+      setState(() {
+        _visibleSets = _filterSetSummaries(_allSets, nextQuery);
+        _searchHits = hits;
+      });
     });
   }
 
@@ -4665,11 +4753,11 @@ class _CollectionScreenState extends State<CollectionScreen> {
     return source;
   }
 
-  List<SetSummary> _filteredSets(List<SetSummary> sets) {
-    if (_query.isEmpty) return sets;
+  List<SetSummary> _filterSetSummaries(List<SetSummary> sets, String query) {
+    if (query.isEmpty) return sets;
     return sets.where((s) {
       final hay = '${s.setName} ${s.setId ?? ''}'.toLowerCase();
-      return hay.contains(_query);
+      return hay.contains(query);
     }).toList();
   }
 
@@ -4789,7 +4877,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
     final allSets = _allSets;
     final hasCollectionContent =
         allSets.isNotEmpty || collectionStore.count > 0;
-    final sets = _filteredSets(allSets);
+    final sets = _visibleSets;
     final totalCards = collectionStore.count;
     final completedSets = allSets
         .where(
@@ -5751,8 +5839,8 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final ownedMap = collectionStore.getOwnedSlotMapForSet(widget.setKey);
-    final previewMap = collectionStore.getPreviewSlotMapForSet(widget.setKey);
+    final ownedMap = collectionStore.ownedSlotMapViewForSet(widget.setKey);
+    final previewMap = collectionStore.previewSlotMapViewForSet(widget.setKey);
 
     final maxOwned = ownedMap.isEmpty
         ? 0
