@@ -979,10 +979,12 @@ class PokemonTcgApi {
     }
 
     final wantsMegaLike = _scannerLooksMegaLike(ocrName);
+    final wantsExLike = _scannerHasMarker(_normalizeScannerName(ocrName), 'ex');
     final candidateNameNorm = _normalizeScannerName(card.name);
     final candidateIsMega =
         candidateNameNorm.contains('mega') ||
         candidateNameNorm.split(' ').contains('m');
+    final candidateHasEx = _scannerHasMarker(candidateNameNorm, 'ex');
 
     if (wantsMegaLike && candidateIsMega) {
       score += 90;
@@ -992,6 +994,29 @@ class PokemonTcgApi {
 
     final sameRecoveredSpecies = recoveredSpecies != null &&
         candidateCore == recoveredSpecies;
+    final sameFroslassFamily = candidateCore == 'froslass';
+    final ocrLooksFroslass =
+        _normalizeScannerName(ocrName).contains('fros') ||
+        _normalizeScannerName(ocrName).contains('rosk') ||
+        _normalizeScannerName(ocrName).contains('rosks') ||
+        recoveredSpecies == 'froslass';
+
+    if (sameFroslassFamily && ocrLooksFroslass) {
+      if ((wantsMegaLike || wantsExLike) && candidateIsMega) {
+        score += 18;
+      }
+      if ((wantsMegaLike || wantsExLike) && candidateHasEx) {
+        score += 14;
+      }
+
+      if (wantNumDigits == 265) {
+        if (gotNumDigits == 265) {
+          score += trustedCollectorSource ? 180 : 115;
+        } else if (gotNumDigits != null) {
+          score -= 18;
+        }
+      }
+    }
 
     if (trustedCollectorSource && sameRecoveredSpecies) {
       score += _scannerSecretTierBonus(card);
@@ -2677,10 +2702,45 @@ class PokemonTcgApi {
               )
               .toList()
             ..sort((a, b) => b.score.compareTo(a.score));
+      final topThree = scored.take(3).toList();
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [froslass-trace] ocrName="$safeName" ocrNumber="${wantNum ?? ''}" '
+        'numberSource="${numberSource ?? ''}" trustedCollectorSource=${_hasTrustedCollectorNumber(numberSource, wantNum)}',
+      );
+      for (var i = 0; i < topThree.length; i++) {
+        final row = topThree[i];
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [top${i + 1}] name="${row.card.name}" '
+          'set="${row.card.setName}" number="${row.card.number}" score=${row.score}',
+        );
+      }
       final ranked = scored.map((row) => row.card).toList();
       final trustedNumber =
           _hasTrustedCollectorNumber(numberSource, wantNum);
       final best = ranked.isEmpty ? null : ranked.first;
+      final secondScore = scored.length >= 2 ? scored[1].score : -9999;
+      final topCore = scored.isNotEmpty
+          ? _scannerCoreSpeciesName(scored.first.card.name)
+          : '';
+
+      if (scored.isNotEmpty &&
+          topCore == 'froslass' &&
+          scored.first.card.number.trim() == '265' &&
+          (scored.first.score - secondScore) > 60) {
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [froslass-autopick] best="${scored.first.card.name}" '
+          'set="${scored.first.card.setName}" '
+          'number="${scored.first.card.number}" lead=${scored.first.score - secondScore}',
+        );
+        return ReliablePick(
+          best: scored.first.card,
+          candidates: ranked,
+          strategy: 'fallback-froslass-265-autopick',
+        );
+      }
 
       if (best != null && !trustedNumber) {
         final bestFamily = _scannerVariantFamilyKey(best);

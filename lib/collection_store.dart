@@ -333,29 +333,43 @@ class CollectionStore extends ChangeNotifier {
     final enabled = user != null && !user.isAnonymous;
 
     debugPrint('COLLECTION AUTH SWITCH >>> oldUid=$oldUid newUid=$newUid');
+    debugPrint(
+      'AUTH FLOW >>> collection auth change received uid=${newUid ?? ''} enabled=$enabled',
+    );
 
     if (_sessionAccessInitialized &&
         oldUid == newUid &&
         _persistentCollectionAccessEnabled == enabled) {
+      debugPrint('AUTH FLOW >>> collection auth change skipped (no-op)');
       return;
     }
 
-    _sessionAccessInitialized = true;
-    _activeUserId = newUid;
-    _authGeneration += 1;
-    _persistentCollectionAccessEnabled = enabled;
+    try {
+      _sessionAccessInitialized = true;
+      _activeUserId = newUid;
+      _authGeneration += 1;
+      _persistentCollectionAccessEnabled = enabled;
 
-    _resetActiveState();
-    _bumpCollectionViewVersion();
-    notifyListeners();
+      debugPrint('AUTH FLOW >>> collection reset triggered generation=$_authGeneration');
+      _resetActiveState();
+      _bumpCollectionViewVersion();
+      notifyListeners();
 
-    if (!enabled) {
-      return;
+      if (!enabled) {
+        debugPrint('AUTH FLOW >>> collection auth change completed without sync');
+        return;
+      }
+
+      debugPrint('AUTH FLOW >>> collection profile load triggered uid=$newUid');
+      await initProfile();
+      debugPrint('AUTH FLOW >>> collection sync triggered uid=$newUid');
+      unawaited(syncFromFirestore());
+      notifyListeners();
+    } catch (e, st) {
+      debugPrint('AUTH FLOW >>> collection auth change failed: $e');
+      debugPrintStack(stackTrace: st);
+      rethrow;
     }
-
-    await initProfile();
-    unawaited(syncFromFirestore());
-    notifyListeners();
   }
 
   Future<void> setPersistentCollectionAccessEnabled(bool enabled) async {

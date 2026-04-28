@@ -1234,14 +1234,6 @@ class EbayListingPreviewSection extends StatelessWidget {
                   padding: EdgeInsets.symmetric(vertical: 8),
                   child: LinearProgressIndicator(minHeight: 2),
                 )
-              else if (items.isEmpty)
-                Text(
-                  'No eBay previews available right now.',
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.72),
-                    fontWeight: FontWeight.w600,
-                  ),
-                )
               else
                 ...items
                     .take(maxListings)

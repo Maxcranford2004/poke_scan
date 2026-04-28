@@ -1,12 +1,13 @@
 ﻿// lib/main.dart
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -24,6 +25,7 @@ import 'featured_card.dart';
 import 'firebase_options.dart';
 
 List<CameraDescription> gCameras = const [];
+const bool kEnableLiveScanPrototype = true;
 
 bool _hasPersistentCollectionAccess(User? user) {
   return user != null && !user.isAnonymous;
@@ -169,24 +171,32 @@ Future<void> _showAccountRequiredToSavePrompt(BuildContext context) async {
 }
 
 Future<void> _startCreateAccountFlow(BuildContext context) async {
+  debugPrint('AUTH FLOW >>> create account route opened');
   final created = await Navigator.of(
     context,
   ).push<bool>(MaterialPageRoute(builder: (_) => const CreateAccountScreen()));
 
+  debugPrint('AUTH FLOW >>> create account route returned created=$created');
   if (created != true || !context.mounted) return;
 
+  debugPrint(
+    'AUTH FLOW >>> post-auth navigation triggered source=create-account',
+  );
   ScaffoldMessenger.of(context).showSnackBar(
     const SnackBar(content: Text('Account created. You can now save cards.')),
   );
 }
 
 Future<void> _startSignInFlow(BuildContext context) async {
+  debugPrint('AUTH FLOW >>> sign in route opened');
   final signedIn = await Navigator.of(
     context,
   ).push<bool>(MaterialPageRoute(builder: (_) => const SignInScreen()));
 
+  debugPrint('AUTH FLOW >>> sign in route returned signedIn=$signedIn');
   if (signedIn != true || !context.mounted) return;
 
+  debugPrint('AUTH FLOW >>> post-auth navigation triggered source=sign-in');
   ScaffoldMessenger.of(context).showSnackBar(
     const SnackBar(content: Text('Signed in. You can now save cards.')),
   );
@@ -236,15 +246,25 @@ class _CreateAccountScreenState extends State<CreateAccountScreen> {
     final form = _formKey.currentState;
     if (form == null || !form.validate()) return;
 
+    debugPrint('AUTH FLOW >>> create account button tapped');
     setState(() => _submitting = true);
 
     try {
-      await FirebaseAuth.instance.createUserWithEmailAndPassword(
-        email: _emailCtrl.text.trim(),
-        password: _passwordCtrl.text,
+      final credential = await FirebaseAuth.instance
+          .createUserWithEmailAndPassword(
+            email: _emailCtrl.text.trim(),
+            password: _passwordCtrl.text,
+          );
+      debugPrint(
+        'AUTH FLOW >>> auth success returned source=create-account uid=${credential.user?.uid ?? ''}',
       );
       if (!mounted) return;
-      Navigator.pop(context, true);
+      final navigator = Navigator.of(context);
+      if (!navigator.canPop()) return;
+      debugPrint(
+        'AUTH FLOW >>> post-auth navigation triggered source=create-account-screen',
+      );
+      navigator.pop(true);
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -413,15 +433,24 @@ class _SignInScreenState extends State<SignInScreen> {
     final form = _formKey.currentState;
     if (form == null || !form.validate()) return;
 
+    debugPrint('AUTH FLOW >>> sign-in button tapped');
     setState(() => _submitting = true);
 
     try {
-      await FirebaseAuth.instance.signInWithEmailAndPassword(
+      final credential = await FirebaseAuth.instance.signInWithEmailAndPassword(
         email: _emailCtrl.text.trim(),
         password: _passwordCtrl.text,
       );
+      debugPrint(
+        'AUTH FLOW >>> auth success returned source=sign-in uid=${credential.user?.uid ?? ''}',
+      );
       if (!mounted) return;
-      Navigator.pop(context, true);
+      final navigator = Navigator.of(context);
+      if (!navigator.canPop()) return;
+      debugPrint(
+        'AUTH FLOW >>> post-auth navigation triggered source=sign-in-screen',
+      );
+      navigator.pop(true);
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -529,7 +558,16 @@ Future<void> main() async {
   await Hive.initFlutter();
 
   await PokemonTcgApi.initCache();
-  await collectionStore.handleAuthUserChanged(FirebaseAuth.instance.currentUser);
+  final initialUser = FirebaseAuth.instance.currentUser;
+  debugPrint(
+    'AUTH FLOW >>> startup auth init uid=${initialUser?.uid ?? ''} anonymous=${initialUser?.isAnonymous ?? false}',
+  );
+  try {
+    await collectionStore.handleAuthUserChanged(initialUser);
+  } catch (e, st) {
+    debugPrint('AUTH FLOW >>> startup auth init failed: $e');
+    debugPrintStack(stackTrace: st);
+  }
 
   final api = PokemonTcgApi();
   unawaited(api.debugHealthCheck());
@@ -632,12 +670,32 @@ class _AppShellState extends State<AppShell> {
   int _index = 0;
   late final StreamSubscription<User?> _authSubscription;
 
+  Future<void> _handleAuthChange(User? user) async {
+    if (!mounted) return;
+    debugPrint(
+      'AUTH FLOW >>> auth listener fired uid=${user?.uid ?? ''} anonymous=${user?.isAnonymous ?? false}',
+    );
+    try {
+      await collectionStore.handleAuthUserChanged(user);
+    } catch (e, st) {
+      debugPrint('AUTH FLOW >>> auth listener error: $e');
+      debugPrintStack(stackTrace: st);
+    }
+  }
+
   @override
   void initState() {
     super.initState();
-    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
-      unawaited(collectionStore.handleAuthUserChanged(user));
-    });
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen(
+      (user) {
+        if (!mounted) return;
+        unawaited(_handleAuthChange(user));
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('AUTH FLOW >>> auth listener stream error: $error');
+        debugPrintStack(stackTrace: stackTrace);
+      },
+    );
   }
 
   @override
@@ -3824,6 +3882,14 @@ class _ScanScreenState extends State<ScanScreen> {
   CameraController? _controller;
   Future<void>? _initFuture;
   XFile? _captured;
+  TextRecognizer? _liveScanRecognizer;
+  bool _liveScanEnabled = kEnableLiveScanPrototype;
+  bool _liveScanStreaming = false;
+  bool _liveScanAnalyzing = false;
+  bool _autoCaptureTriggered = false;
+  int _stableLiveDetections = 0;
+  DateTime? _lastLiveAnalysisAt;
+  String _liveScanStatus = 'Looking for card…';
 
   @override
   void initState() {
@@ -3834,28 +3900,208 @@ class _ScanScreenState extends State<ScanScreen> {
       widget.cameras.first,
       ResolutionPreset.high,
       enableAudio: false,
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888,
     );
-    _initFuture = _controller!.initialize();
+    _initFuture = _controller!.initialize().then((_) async {
+      if (_liveScanEnabled) {
+        _liveScanRecognizer = TextRecognizer(
+          script: TextRecognitionScript.latin,
+        );
+        await _maybeStartLiveScan();
+      }
+    });
   }
 
   @override
   void dispose() {
+    unawaited(_stopLiveScan());
+    if (_liveScanRecognizer != null) {
+      unawaited(_liveScanRecognizer!.close());
+    }
     _controller?.dispose();
     super.dispose();
   }
 
-  Future<void> _takePhoto() async {
+  Future<void> _maybeStartLiveScan() async {
+    final controller = _controller;
+    if (!_liveScanEnabled || controller == null || !mounted) return;
+    if (!Platform.isAndroid) {
+      _liveScanEnabled = false;
+      return;
+    }
+    if (!controller.value.isInitialized ||
+        controller.value.isStreamingImages ||
+        _captured != null ||
+        _autoCaptureTriggered) {
+      return;
+    }
+
+    _stableLiveDetections = 0;
+    _lastLiveAnalysisAt = null;
+    if (mounted) {
+      setState(() => _liveScanStatus = 'Looking for card…');
+    }
+
+    try {
+      await controller.startImageStream((image) {
+        unawaited(_handleLiveFrame(image));
+      });
+      _liveScanStreaming = true;
+    } catch (e) {
+      debugPrint('LIVE SCAN >>> stream start failed: $e');
+      _liveScanEnabled = false;
+      _liveScanStreaming = false;
+    }
+  }
+
+  Future<void> _stopLiveScan() async {
+    final controller = _controller;
+    if (controller == null || !_liveScanStreaming) return;
+    try {
+      await controller.stopImageStream();
+    } catch (e) {
+      debugPrint('LIVE SCAN >>> stream stop failed: $e');
+    } finally {
+      _liveScanStreaming = false;
+      _liveScanAnalyzing = false;
+    }
+  }
+
+  Future<void> _handleLiveFrame(CameraImage image) async {
+    if (!_liveScanEnabled ||
+        _autoCaptureTriggered ||
+        _captured != null ||
+        _liveScanAnalyzing) {
+      return;
+    }
+    if (_stableLiveDetections > 5) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final last = _lastLiveAnalysisAt;
+    if (last != null && now.difference(last).inMilliseconds < 1000) {
+      return;
+    }
+    _lastLiveAnalysisAt = now;
+    _liveScanAnalyzing = true;
+
+    try {
+      final hasSignal = await _detectLiveCardSignal(image);
+      if (!_liveScanEnabled || _captured != null || _autoCaptureTriggered) {
+        return;
+      }
+
+      if (hasSignal) {
+        _stableLiveDetections += 1;
+        if (!mounted) return;
+        setState(() {
+          _liveScanStatus = _stableLiveDetections >= 2
+              ? 'Card detected'
+              : 'Hold steady…';
+        });
+        if (_stableLiveDetections >= 2) {
+          _autoCaptureTriggered = true;
+          unawaited(_autoCapturePhoto());
+        }
+      } else {
+        _stableLiveDetections = 0;
+        if (!mounted) return;
+        setState(() => _liveScanStatus = 'Looking for card…');
+      }
+    } catch (e) {
+      debugPrint('LIVE SCAN >>> frame analysis failed: $e');
+      _liveScanEnabled = false;
+      await _stopLiveScan();
+    } finally {
+      _liveScanAnalyzing = false;
+    }
+  }
+
+  Future<bool> _detectLiveCardSignal(CameraImage image) async {
+    final recognizer = _liveScanRecognizer;
+    final controller = _controller;
+    if (recognizer == null || controller == null) return false;
+    if (image.planes.isEmpty) return false;
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    final rotation = InputImageRotationValue.fromRawValue(
+      controller.description.sensorOrientation,
+    );
+    if (format == null || rotation == null) return false;
+
+    final bytes = image.planes.fold<Uint8List>(Uint8List(0), (
+      previousValue,
+      plane,
+    ) {
+      final merged = Uint8List(previousValue.length + plane.bytes.length);
+      merged.setRange(0, previousValue.length, previousValue);
+      merged.setRange(previousValue.length, merged.length, plane.bytes);
+      return merged;
+    });
+
+    if (bytes.isEmpty) return false;
+
+    final metadata = InputImageMetadata(
+      size: Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: rotation,
+      format: format,
+      bytesPerRow: image.planes.first.bytesPerRow,
+    );
+
+    final input = InputImage.fromBytes(bytes: bytes, metadata: metadata);
+    final recognized = await recognizer.processImage(input);
+    final raw = recognized.text.toLowerCase();
+    if (raw.trim().length < 12) return false;
+
+    var evidence = 0;
+    if (RegExp(
+      r'\b(hp|stage|basic|trainer|energy|weakness|resistance|retreat)\b',
+    ).hasMatch(raw)) {
+      evidence += 1;
+    }
+    if (RegExp(r'\b(mega|ex|gx|vmax|vstar)\b').hasMatch(raw)) {
+      evidence += 1;
+    }
+    if (RegExp(r'\d{1,4}\s*/\s*\d{2,4}').hasMatch(raw)) {
+      evidence += 1;
+    }
+    if (recognized.blocks.length >= 3) {
+      evidence += 1;
+    }
+    return evidence >= 2;
+  }
+
+  Future<void> _autoCapturePhoto() async {
+    await _takePhoto(fromLiveScan: true);
+  }
+
+  Future<void> _takePhoto({bool fromLiveScan = false}) async {
     final controller = _controller;
     if (controller == null) return;
 
     try {
       if (!controller.value.isInitialized) return;
       if (controller.value.isTakingPicture) return;
+      if (_liveScanStreaming || controller.value.isStreamingImages) {
+        await _stopLiveScan();
+      }
 
       final file = await controller.takePicture();
       if (!mounted) return;
-      setState(() => _captured = file);
+      setState(() {
+        _captured = file;
+        if (fromLiveScan) {
+          _liveScanStatus = 'Card detected';
+        }
+      });
     } catch (e) {
+      if (fromLiveScan) {
+        _autoCaptureTriggered = false;
+        unawaited(_maybeStartLiveScan());
+      }
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
@@ -3863,30 +4109,22 @@ class _ScanScreenState extends State<ScanScreen> {
     }
   }
 
-  void _retake() => setState(() => _captured = null);
+  void _retake() {
+    setState(() {
+      _captured = null;
+      _autoCaptureTriggered = false;
+      _stableLiveDetections = 0;
+      _liveScanStatus = 'Looking for card…';
+    });
+    if (_liveScanEnabled) {
+      unawaited(_maybeStartLiveScan());
+    }
+  }
 
   void _usePhoto() {
     final file = _captured;
     if (file == null) return;
 
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => RecognizingScreen(
-          photoPath: file.path,
-          expectedSetId: widget.expectedSetId,
-          expectedSlot: widget.expectedSlot,
-        ),
-      ),
-    );
-  }
-
-  Future<void> _pickFromGallery() async {
-    final picker = ImagePicker();
-    final file = await picker.pickImage(source: ImageSource.gallery);
-    if (file == null) return;
-
-    if (!mounted) return;
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -3936,15 +4174,33 @@ class _ScanScreenState extends State<ScanScreen> {
                 return Stack(
                   children: [
                     Positioned.fill(child: CameraPreview(controller)),
-                    Positioned(
-                      top: 16,
-                      right: 16,
-                      child: ElevatedButton.icon(
-                        onPressed: _pickFromGallery,
-                        icon: const Icon(Icons.photo),
-                        label: const Text('Pick'),
+                    if (_liveScanEnabled)
+                      Positioned(
+                        top: 18,
+                        left: 16,
+                        right: 16,
+                        child: Center(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withOpacity(0.58),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: Colors.white.withOpacity(0.12),
+                              ),
+                            ),
+                            child: Text(
+                              _liveScanStatus,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
                     Center(
                       child: Container(
                         width: MediaQuery.of(context).size.width * 0.78,
@@ -3961,7 +4217,7 @@ class _ScanScreenState extends State<ScanScreen> {
                       bottom: 28,
                       child: Center(
                         child: GestureDetector(
-                          onTap: _takePhoto,
+                          onTap: () => _takePhoto(),
                           child: Container(
                             width: 74,
                             height: 74,
@@ -4000,6 +4256,40 @@ class _PreviewScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(
       children: [
+        SafeArea(
+          bottom: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+            child: Column(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: Colors.white.withOpacity(0.12)),
+                  ),
+                  child: const Text(
+                    'Card captured',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Make sure the card name and number are visible.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.74),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
         Expanded(
           child: Container(
             color: Colors.black,
@@ -4023,7 +4313,7 @@ class _PreviewScreen extends StatelessWidget {
                 Expanded(
                   child: ElevatedButton(
                     onPressed: onUse,
-                    child: const Text('Use Photo'),
+                    child: const Text('Identify card'),
                   ),
                 ),
               ],
@@ -6131,6 +6421,7 @@ class _SetPokedexScreenState extends State<SetPokedexScreen> {
           slot: slot,
           preview: preview,
           setKey: widget.setKey,
+          setName: widget.setName,
         ),
       ),
     );
@@ -6185,12 +6476,14 @@ class LockedCardShowcaseScreen extends StatelessWidget {
   final int slot;
   final PreviewCard? preview;
   final String setKey;
+  final String setName;
 
   const LockedCardShowcaseScreen({
     super.key,
     required this.slot,
     required this.preview,
     required this.setKey,
+    required this.setName,
   });
 
   @override
@@ -6201,6 +6494,19 @@ class LockedCardShowcaseScreen extends StatelessWidget {
 
     final img = (preview?.imageSmall ?? '').trim();
     final label = '#$slot';
+    final ebayQuery = buildEbayQuery(
+      name: name.isNotEmpty ? name : 'Pokemon card',
+      setName: setName,
+      number: '$slot',
+      printedTotal: null,
+      mode: EbayMode.raw,
+    );
+    final ebaySearchUrl = Uri.parse(
+      'https://www.ebay.com/sch/i.html?_nkw=${Uri.encodeComponent(ebayQuery)}',
+    );
+    final ebaySoldUrl = Uri.parse(
+      'https://www.ebay.com/sch/i.html?_nkw=${Uri.encodeComponent(ebayQuery)}&LH_Sold=1&LH_Complete=1',
+    );
 
     return Scaffold(
       appBar: AppBar(title: Text('Register #$slot')),
@@ -6264,20 +6570,6 @@ class LockedCardShowcaseScreen extends StatelessWidget {
 
                     const SizedBox(height: 14),
 
-                    _LockedPanel(
-                      title: 'Details',
-                      subtitle: 'Locked until you scan this card.',
-                      icon: Icons.lock,
-                    ),
-                    const SizedBox(height: 10),
-                    _LockedPanel(
-                      title: 'eBay',
-                      subtitle: 'Listings unlock after registration.',
-                      icon: Icons.lock,
-                    ),
-
-                    const SizedBox(height: 14),
-
                     SizedBox(
                       width: double.infinity,
                       height: 56,
@@ -6299,16 +6591,53 @@ class LockedCardShowcaseScreen extends StatelessWidget {
                       ),
                     ),
 
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 14),
 
-                    SizedBox(
+                    _LockedPanel(
+                      title: 'Details',
+                      subtitle: 'Locked until you scan this card.',
+                      icon: Icons.lock,
+                    ),
+                    const SizedBox(height: 10),
+                    Container(
                       width: double.infinity,
-                      height: 56,
-                      child: OutlinedButton(
-                        onPressed: () => Navigator.pop(context),
-                        child: const Text('Back to Pokédex'),
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.06),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: Colors.white.withOpacity(0.08)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'eBay',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Browse active or sold listings while this card is still missing from your Pokédex.',
+                            style: TextStyle(
+                              color: Colors.white.withOpacity(0.76),
+                              fontWeight: FontWeight.w600,
+                              height: 1.35,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          const SizedBox(height: 12),
+                          EbayListingPreviewSection(
+                            query: ebayQuery,
+                            accentColor: const Color(0xFF7DD3FC),
+                            title: 'eBay Preview',
+                          ),
+                        ],
                       ),
                     ),
+
+                    const SizedBox(height: 14),
                   ],
                 ),
               ),
@@ -7240,8 +7569,6 @@ class _MissingSlotTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hasPreview = previewImageUrl != null && previewImageUrl!.isNotEmpty;
-    final showName =
-        previewName != null && previewName!.trim().isNotEmpty && hasPreview;
     final highlightColor = const Color(0xFF7DD3FC);
 
     return TweenAnimationBuilder<double>(
@@ -7322,82 +7649,30 @@ class _MissingSlotTile extends StatelessWidget {
                       ),
                     ),
                     Positioned(
-                      left: 8,
-                      top: 8,
+                      left: 0,
+                      right: 0,
+                      bottom: 10,
                       child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.45),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          '$slot',
-                          style: const TextStyle(fontWeight: FontWeight.w900),
-                        ),
-                      ),
-                    ),
-                    Positioned(
-                      right: 8,
-                      top: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.52),
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: Colors.white.withOpacity(0.10),
+                        alignment: Alignment.center,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.45),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text(
+                            '$slot',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w900,
+                            ),
                           ),
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: const [
-                            Icon(
-                              Icons.lock_outline,
-                              size: 12,
-                              color: Colors.white70,
-                            ),
-                            SizedBox(width: 4),
-                            Text(
-                              'LOCKED',
-                              style: TextStyle(
-                                fontSize: 10,
-                                fontWeight: FontWeight.w900,
-                                letterSpacing: 0.5,
-                                color: Colors.white70,
-                              ),
-                            ),
-                          ],
-                        ),
                       ),
                     ),
-                    if (showPreviewLabel && showName)
-                      Positioned(
-                        left: 8,
-                        right: 8,
-                        bottom: 8,
-                        child: _SlotStateFooter(
-                          title: previewName!,
-                          subtitle: 'Tap to scan and unlock',
-                          locked: true,
-                        ),
-                      ),
-                    if (!showPreviewLabel || !showName)
-                      Positioned(
-                        left: 8,
-                        right: 8,
-                        bottom: 8,
-                        child: _SlotStateFooter(
-                          title: hasPreview ? 'Missing card' : 'Unknown card',
-                          subtitle: 'Tap to scan and unlock',
-                          locked: true,
-                        ),
-                      ),
                   ],
                 ),
               ),
