@@ -1,5 +1,6 @@
 ﻿// lib/main.dart
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -615,6 +616,11 @@ class CardScanApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      builder: (context, child) {
+        return Stack(
+          children: [if (child != null) child, const RewardOverlayHost()],
+        );
+      },
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
@@ -718,9 +724,6 @@ class _AppShellState extends State<AppShell> {
         children: [
           const Positioned.fill(child: AnimatedBackground()),
           IndexedStack(index: _index, children: tabs),
-          const XpOverlay(),
-          const AchievementOverlay(),
-          const PokedexRegisteredOverlay(),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -2319,8 +2322,172 @@ class _AchievementPalette {
   });
 }
 
+class _RewardOverlayGate extends ChangeNotifier {
+  int _holdCount = 0;
+
+  bool get isHeld => _holdCount > 0;
+
+  void hold() {
+    _holdCount += 1;
+    notifyListeners();
+  }
+
+  void release() {
+    if (_holdCount == 0) return;
+    _holdCount -= 1;
+    notifyListeners();
+  }
+}
+
+final _rewardOverlayGate = _RewardOverlayGate();
+
+enum _QueuedRewardKind { xp, achievement, pokedex }
+
+class _QueuedReward {
+  final int id;
+  final _QueuedRewardKind kind;
+  final XpEvent? xpEvent;
+  final AchievementEvent? achievementEvent;
+  final PokedexEvent? pokedexEvent;
+
+  const _QueuedReward._({
+    required this.id,
+    required this.kind,
+    this.xpEvent,
+    this.achievementEvent,
+    this.pokedexEvent,
+  });
+
+  factory _QueuedReward.xp(int id, XpEvent event) {
+    return _QueuedReward._(id: id, kind: _QueuedRewardKind.xp, xpEvent: event);
+  }
+
+  factory _QueuedReward.achievement(int id, AchievementEvent event) {
+    return _QueuedReward._(
+      id: id,
+      kind: _QueuedRewardKind.achievement,
+      achievementEvent: event,
+    );
+  }
+
+  factory _QueuedReward.pokedex(int id, PokedexEvent event) {
+    return _QueuedReward._(
+      id: id,
+      kind: _QueuedRewardKind.pokedex,
+      pokedexEvent: event,
+    );
+  }
+}
+
+class RewardOverlayHost extends StatefulWidget {
+  const RewardOverlayHost({super.key});
+
+  @override
+  State<RewardOverlayHost> createState() => _RewardOverlayHostState();
+}
+
+class _RewardOverlayHostState extends State<RewardOverlayHost> {
+  final Queue<_QueuedReward> _pendingRewards = Queue<_QueuedReward>();
+  _QueuedReward? _activeReward;
+  int _nextRewardId = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    collectionStore.lastXpEvent.addListener(_onXpEvent);
+    collectionStore.lastAchievementEvent.addListener(_onAchievementEvent);
+    collectionStore.lastPokedexEvent.addListener(_onPokedexEvent);
+    _rewardOverlayGate.addListener(_onGateChanged);
+  }
+
+  void _onXpEvent() {
+    final event = collectionStore.lastXpEvent.value;
+    if (event == null) return;
+    _enqueueReward(_QueuedReward.xp(_nextRewardId++, event));
+  }
+
+  void _onAchievementEvent() {
+    final event = collectionStore.lastAchievementEvent.value;
+    if (event == null) return;
+    _enqueueReward(_QueuedReward.achievement(_nextRewardId++, event));
+  }
+
+  void _onPokedexEvent() {
+    final event = collectionStore.lastPokedexEvent.value;
+    if (event == null) return;
+    _enqueueReward(_QueuedReward.pokedex(_nextRewardId++, event));
+  }
+
+  void _enqueueReward(_QueuedReward reward) {
+    if (!mounted) return;
+    setState(() {
+      _pendingRewards.addLast(reward);
+      _activeReward ??= _nextRewardIfAllowed();
+    });
+  }
+
+  void _finishReward(int rewardId) {
+    if (!mounted || _activeReward?.id != rewardId) return;
+    setState(() {
+      _activeReward = _nextRewardIfAllowed();
+    });
+  }
+
+  _QueuedReward? _nextRewardIfAllowed() {
+    if (_rewardOverlayGate.isHeld || _pendingRewards.isEmpty) return null;
+    return _pendingRewards.removeFirst();
+  }
+
+  void _onGateChanged() {
+    if (!mounted || _rewardOverlayGate.isHeld || _activeReward != null) return;
+    if (_pendingRewards.isEmpty) return;
+    setState(() {
+      _activeReward = _nextRewardIfAllowed();
+    });
+  }
+
+  @override
+  void dispose() {
+    collectionStore.lastXpEvent.removeListener(_onXpEvent);
+    collectionStore.lastAchievementEvent.removeListener(_onAchievementEvent);
+    collectionStore.lastPokedexEvent.removeListener(_onPokedexEvent);
+    _rewardOverlayGate.removeListener(_onGateChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reward = _activeReward;
+    if (reward == null) return const SizedBox.shrink();
+
+    switch (reward.kind) {
+      case _QueuedRewardKind.xp:
+        return XpOverlay(
+          key: ValueKey('xp_${reward.id}'),
+          event: reward.xpEvent!,
+          onComplete: () => _finishReward(reward.id),
+        );
+      case _QueuedRewardKind.achievement:
+        return AchievementOverlay(
+          key: ValueKey('achievement_${reward.id}'),
+          event: reward.achievementEvent!,
+          onComplete: () => _finishReward(reward.id),
+        );
+      case _QueuedRewardKind.pokedex:
+        return PokedexRegisteredOverlay(
+          key: ValueKey('pokedex_${reward.id}'),
+          event: reward.pokedexEvent!,
+          onComplete: () => _finishReward(reward.id),
+        );
+    }
+  }
+}
+
 class XpOverlay extends StatefulWidget {
-  const XpOverlay({super.key});
+  final XpEvent event;
+  final VoidCallback onComplete;
+
+  const XpOverlay({super.key, required this.event, required this.onComplete});
 
   @override
   State<XpOverlay> createState() => _XpOverlayState();
@@ -2330,8 +2497,7 @@ class _XpOverlayState extends State<XpOverlay>
     with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
   late final Animation<double> _fade;
-
-  XpEvent? _event;
+  bool _didComplete = false;
 
   @override
   void initState() {
@@ -2343,32 +2509,23 @@ class _XpOverlayState extends State<XpOverlay>
     );
 
     _fade = CurvedAnimation(parent: _controller, curve: Curves.easeOut);
-
-    collectionStore.lastXpEvent.addListener(_onXpEvent);
-  }
-
-  void _onXpEvent() {
-    final e = collectionStore.lastXpEvent.value;
-    if (e == null) return;
-
-    setState(() {
-      _event = e;
+    _controller.addStatusListener((status) {
+      if (status == AnimationStatus.completed && !_didComplete) {
+        _didComplete = true;
+        widget.onComplete();
+      }
     });
-
-    _controller.forward(from: 0);
+    _controller.forward();
   }
 
   @override
   void dispose() {
-    collectionStore.lastXpEvent.removeListener(_onXpEvent);
     _controller.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_event == null) return const SizedBox.shrink();
-
     return IgnorePointer(
       child: FadeTransition(
         opacity: Tween(begin: 1.0, end: 0.0).animate(_fade),
@@ -2386,14 +2543,14 @@ class _XpOverlayState extends State<XpOverlay>
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    '+${_event!.xpGained} XP',
+                    '+${widget.event.xpGained} XP',
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  if (_event!.leveledUp)
+                  if (widget.event.leveledUp)
                     const Padding(
                       padding: EdgeInsets.only(top: 4),
                       child: Text(
@@ -2415,7 +2572,14 @@ class _XpOverlayState extends State<XpOverlay>
 }
 
 class AchievementOverlay extends StatefulWidget {
-  const AchievementOverlay({super.key});
+  final AchievementEvent event;
+  final VoidCallback onComplete;
+
+  const AchievementOverlay({
+    super.key,
+    required this.event,
+    required this.onComplete,
+  });
 
   @override
   State<AchievementOverlay> createState() => _AchievementOverlayState();
@@ -2432,8 +2596,7 @@ class _AchievementOverlayState extends State<AchievementOverlay>
   late final Animation<double> _medalTurn;
   late final Animation<double> _tierResolve;
   late final Animation<double> _glow;
-
-  AchievementEvent? _event;
+  bool _didComplete = false;
 
   @override
   void initState() {
@@ -2570,27 +2733,15 @@ class _AchievementOverlayState extends State<AchievementOverlay>
     ]).animate(_controller);
 
     _controller.addStatusListener((status) {
-      if (status == AnimationStatus.completed && mounted) {
-        setState(() => _event = null);
+      if (status == AnimationStatus.completed && !_didComplete) {
+        _didComplete = true;
+        widget.onComplete();
       }
     });
-
-    collectionStore.lastAchievementEvent.addListener(_onAchievementEvent);
-  }
-
-  void _onAchievementEvent() {
-    final e = collectionStore.lastAchievementEvent.value;
-    if (e == null) return;
-
-    setState(() {
-      _event = e;
-    });
-
-    _controller.forward(from: 0);
+    _controller.forward();
   }
 
   Future<void> _dismissEarly() async {
-    if (_event == null) return;
     if (_controller.status == AnimationStatus.completed) return;
     await _controller.animateTo(
       1.0,
@@ -2601,14 +2752,11 @@ class _AchievementOverlayState extends State<AchievementOverlay>
 
   @override
   void dispose() {
-    collectionStore.lastAchievementEvent.removeListener(_onAchievementEvent);
     _controller.dispose();
     super.dispose();
   }
 
   Widget buildLegacy(BuildContext context) {
-    if (_event == null) return const SizedBox.shrink();
-
     return IgnorePointer(
       child: FadeTransition(
         opacity: _fade,
@@ -2638,7 +2786,7 @@ class _AchievementOverlayState extends State<AchievementOverlay>
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    _event!.title,
+                    widget.event.title,
                     style: const TextStyle(
                       color: Color(0xFFFFD166),
                       fontSize: 18,
@@ -2656,9 +2804,8 @@ class _AchievementOverlayState extends State<AchievementOverlay>
 
   @override
   Widget build(BuildContext context) {
-    if (_event == null) return const SizedBox.shrink();
-    final spec = _achievementVisualSpecForId(_event!.id);
-    final description = _achievementDescriptionForId(_event!.id);
+    final spec = _achievementVisualSpecForId(widget.event.id);
+    final description = _achievementDescriptionForId(widget.event.id);
     final finalPalette = _achievementPaletteFor(
       unlocked: true,
       tier: spec.tier,
@@ -2693,7 +2840,7 @@ class _AchievementOverlayState extends State<AchievementOverlay>
                     child: ScaleTransition(
                       scale: _bannerScale,
                       child: _AchievementCelebrationBanner(
-                        title: _event!.title,
+                        title: widget.event.title,
                         description: description,
                         icon: spec.icon,
                         entryPalette: entryPalette,
@@ -2744,8 +2891,741 @@ _AchievementPalette _lerpAchievementPalette(
   );
 }
 
+enum _PostScanReturnKind { home, setPokedex }
+
+class _PostScanReturnTarget {
+  final _PostScanReturnKind kind;
+  final String? setKey;
+  final int? slot;
+
+  const _PostScanReturnTarget.home()
+    : kind = _PostScanReturnKind.home,
+      setKey = null,
+      slot = null;
+
+  const _PostScanReturnTarget.setPokedex({
+    required this.setKey,
+    required this.slot,
+  }) : kind = _PostScanReturnKind.setPokedex;
+}
+
+class PostScanOwnedShowcaseScreen extends StatefulWidget {
+  final PokemonCardResult card;
+  final _PostScanReturnTarget returnTarget;
+
+  const PostScanOwnedShowcaseScreen({
+    super.key,
+    required this.card,
+    required this.returnTarget,
+  });
+
+  @override
+  State<PostScanOwnedShowcaseScreen> createState() =>
+      _PostScanOwnedShowcaseScreenState();
+}
+
+class _PostScanOwnedShowcaseScreenState
+    extends State<PostScanOwnedShowcaseScreen> {
+  bool _exiting = false;
+
+  Future<bool> _handleExit() async {
+    if (_exiting || !mounted) return false;
+    _exiting = true;
+
+    final route = switch (widget.returnTarget.kind) {
+      _PostScanReturnKind.home => MaterialPageRoute(
+        builder: (_) => PostScanExitRegistrationAnimationScreen(
+          card: widget.card,
+          returnTarget: widget.returnTarget,
+        ),
+      ),
+      _PostScanReturnKind.setPokedex => MaterialPageRoute(
+        builder: (_) => PostScanExitRegistrationAnimationScreen(
+          card: widget.card,
+          returnTarget: widget.returnTarget,
+        ),
+      ),
+    };
+
+    Navigator.pushReplacement(context, route);
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: _handleExit,
+      child: OwnedCardShowcaseScreen(card: widget.card),
+    );
+  }
+}
+
+class PostScanExitRegistrationAnimationScreen extends StatefulWidget {
+  final PokemonCardResult card;
+  final _PostScanReturnTarget returnTarget;
+
+  const PostScanExitRegistrationAnimationScreen({
+    super.key,
+    required this.card,
+    required this.returnTarget,
+  });
+
+  @override
+  State<PostScanExitRegistrationAnimationScreen> createState() =>
+      _PostScanExitRegistrationAnimationScreenState();
+}
+
+class _PostScanExitRegistrationAnimationScreenState
+    extends State<PostScanExitRegistrationAnimationScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _gridReveal;
+  late final Animation<double> _cardScale;
+  late final Animation<double> _cardTurn;
+  late final Animation<double> _slotPulse;
+  late final Animation<double> _flash;
+
+  late final String _setKey;
+  late final int _targetSlot;
+
+  static const int _gridColumns = 4;
+  static const int _visibleSlotCount = 12;
+
+  String get _cardUrl => widget.card.imageLarge.isNotEmpty
+      ? widget.card.imageLarge
+      : widget.card.imageSmall;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _setKey = widget.returnTarget.setKey?.trim().isNotEmpty == true
+        ? widget.returnTarget.setKey!.trim()
+        : widget.card.setId.trim();
+    _targetSlot = _resolveTargetSlot();
+
+    collectionStore.setIndexVersion.addListener(_onStoreChanged);
+    if (_setKey.isNotEmpty && !collectionStore.hasSetIndex(_setKey)) {
+      unawaited(
+        collectionStore.ensureSetIndexLoaded(setKey: _setKey, setId: _setKey),
+      );
+    }
+
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1750),
+    );
+
+    _gridReveal = CurvedAnimation(
+      parent: _controller,
+      curve: const Interval(0.0, 0.22, curve: Curves.easeOutCubic),
+    );
+
+    _cardScale = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.0,
+          end: 1.05,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 18,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.05,
+          end: 0.27,
+        ).chain(CurveTween(curve: Curves.easeInOutCubic)),
+        weight: 54,
+      ),
+      TweenSequenceItem(tween: ConstantTween<double>(0.27), weight: 28),
+    ]).animate(_controller);
+
+    _cardTurn = Tween<double>(begin: 0, end: 0.23).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0.18, 0.72, curve: Curves.easeInOutCubic),
+      ),
+    );
+
+    _slotPulse = TweenSequence<double>([
+      TweenSequenceItem(tween: ConstantTween<double>(1.0), weight: 72),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.0,
+          end: 1.2,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 12,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1.2,
+          end: 1.0,
+        ).chain(CurveTween(curve: Curves.easeInOut)),
+        weight: 16,
+      ),
+    ]).animate(_controller);
+
+    _flash = TweenSequence<double>([
+      TweenSequenceItem(tween: ConstantTween<double>(0), weight: 70),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 0,
+          end: 1,
+        ).chain(CurveTween(curve: Curves.easeOut)),
+        weight: 10,
+      ),
+      TweenSequenceItem(
+        tween: Tween<double>(
+          begin: 1,
+          end: 0,
+        ).chain(CurveTween(curve: Curves.easeIn)),
+        weight: 20,
+      ),
+    ]).animate(_controller);
+
+    _controller.addStatusListener((status) {
+      if (status == AnimationStatus.completed && mounted) {
+        _finishExit();
+      }
+    });
+
+    _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    collectionStore.setIndexVersion.removeListener(_onStoreChanged);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onStoreChanged() {
+    if (mounted) setState(() {});
+  }
+
+  int _resolveTargetSlot() {
+    final explicit = widget.returnTarget.slot;
+    if (explicit != null && explicit > 0) return explicit;
+
+    final digits = widget.card.number.replaceAll(RegExp(r'[^0-9]'), '');
+    final parsed = int.tryParse(digits);
+    if (parsed != null && parsed > 0) return parsed;
+    return 1;
+  }
+
+  bool get _hasImpacted => _controller.value >= 0.72;
+
+  int _deriveTotalSlots(
+    Map<int, PreviewCard> previewMap,
+    Map<int, PokemonCardResult> ownedMap,
+  ) {
+    final printedTotal = widget.card.setPrintedTotal;
+    if (printedTotal != null && printedTotal > 0) return printedTotal;
+
+    var maxSlot = _targetSlot;
+    for (final slot in previewMap.keys) {
+      if (slot > maxSlot) maxSlot = slot;
+    }
+    for (final slot in ownedMap.keys) {
+      if (slot > maxSlot) maxSlot = slot;
+    }
+    return maxSlot.clamp(1, 9999).toInt();
+  }
+
+  List<int> _visibleSlotsForTotal(int totalSlots) {
+    final totalVisible = totalSlots < _visibleSlotCount
+        ? totalSlots
+        : _visibleSlotCount;
+    if (totalVisible <= 0) return <int>[_targetSlot];
+
+    var start = _targetSlot - (totalVisible ~/ 2);
+    if (start < 1) start = 1;
+    final maxStart = (totalSlots - totalVisible + 1)
+        .clamp(1, totalSlots)
+        .toInt();
+    if (start > maxStart) start = maxStart;
+    return List<int>.generate(totalVisible, (index) => start + index);
+  }
+
+  Widget _gridSlot({
+    required int slot,
+    required bool isOwnedBeforeScan,
+    required bool isTargetSlot,
+    required bool isFilledAfterImpact,
+    required PreviewCard? preview,
+    required PokemonCardResult? ownedCard,
+    required Color accentColor,
+  }) {
+    final effectiveOwned = isFilledAfterImpact || isOwnedBeforeScan;
+    final imageUrl = effectiveOwned
+        ? ((ownedCard?.imageSmall.isNotEmpty ?? false)
+              ? ownedCard!.imageSmall
+              : (ownedCard?.imageLarge ?? ''))
+        : ((preview?.imageSmall.isNotEmpty ?? false)
+              ? preview!.imageSmall
+              : (preview?.imageLarge ?? ''));
+
+    final cardFace = imageUrl.isEmpty
+        ? Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Colors.white.withOpacity(0.10),
+                  Colors.white.withOpacity(0.04),
+                ],
+              ),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              '#$slot',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.82),
+                fontWeight: FontWeight.w900,
+                fontSize: 12,
+              ),
+            ),
+          )
+        : Image.network(
+            imageUrl,
+            fit: BoxFit.cover,
+            errorBuilder: (_, __, ___) => Container(
+              color: Colors.white.withOpacity(0.06),
+              alignment: Alignment.center,
+              child: const Icon(Icons.style, size: 20, color: Colors.white70),
+            ),
+          );
+
+    final displayedFace = effectiveOwned
+        ? cardFace
+        : ColorFiltered(
+            colorFilter: const ColorFilter.matrix(kGreyMatrix),
+            child: cardFace,
+          );
+
+    final pulseScale = isTargetSlot ? _slotPulse.value : 1.0;
+    final flashOpacity = isTargetSlot ? _flash.value : 0.0;
+
+    return Transform.scale(
+      scale: pulseScale,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: isTargetSlot
+                      ? accentColor.withOpacity(effectiveOwned ? 0.9 : 0.45)
+                      : Colors.white.withOpacity(0.12),
+                  width: isTargetSlot ? 1.8 : 1.0,
+                ),
+                boxShadow: [
+                  if (isTargetSlot)
+                    BoxShadow(
+                      color: accentColor.withOpacity(
+                        0.18 + (0.26 * flashOpacity),
+                      ),
+                      blurRadius: 18,
+                      spreadRadius: 1.2 * flashOpacity,
+                    ),
+                ],
+              ),
+            ),
+          ),
+          Positioned.fill(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: displayedFace,
+            ),
+          ),
+          if (isTargetSlot)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    gradient: RadialGradient(
+                      center: const Alignment(0, -0.2),
+                      radius: 0.85,
+                      colors: [
+                        Colors.white.withOpacity(0.34 * flashOpacity),
+                        accentColor.withOpacity(0.24 * flashOpacity),
+                        Colors.transparent,
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          Positioned(
+            left: 6,
+            bottom: 6,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.58),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: Colors.white.withOpacity(0.12)),
+              ),
+              child: Text(
+                '#$slot',
+                style: const TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _finishExit() {
+    Navigator.popUntil(context, (route) => route.isFirst);
+    _rewardOverlayGate.release();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final url = _cardUrl.trim();
+    final accentColor = cardAccentColor(widget.card);
+    final ownedMap = _setKey.isNotEmpty
+        ? collectionStore.ownedSlotMapViewForSet(_setKey)
+        : const <int, PokemonCardResult>{};
+    final previewMap = _setKey.isNotEmpty
+        ? collectionStore.previewSlotMapViewForSet(_setKey)
+        : const <int, PreviewCard>{};
+    final totalSlots = _deriveTotalSlots(previewMap, ownedMap);
+    final visibleSlots = _visibleSlotsForTotal(totalSlots);
+    final targetIndex = visibleSlots
+        .indexOf(_targetSlot)
+        .clamp(0, visibleSlots.length - 1)
+        .toInt();
+    final setName = widget.card.setName.trim().isEmpty
+        ? (_setKey.isEmpty ? 'Collection Set' : _setKey.toUpperCase())
+        : widget.card.setName;
+    final ownedCount = ownedMap.length;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF070A16),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxWidth = constraints.maxWidth;
+          final maxHeight = constraints.maxHeight;
+          final gridWidth = (maxWidth - 40).clamp(280.0, 360.0).toDouble();
+          final spacing = 10.0;
+          final cellWidth =
+              (gridWidth - ((_gridColumns - 1) * spacing)) / _gridColumns;
+          const gridRows = 3;
+          final gridHeight =
+              (cellWidth * 1.42 * gridRows) + (spacing * (gridRows - 1));
+          final gridLeft = (maxWidth - gridWidth) / 2;
+          final gridTop = maxHeight * 0.46;
+          final targetRow = targetIndex ~/ _gridColumns;
+          final targetCol = targetIndex % _gridColumns;
+          final targetCenter = Offset(
+            gridLeft + (targetCol * (cellWidth + spacing)) + (cellWidth / 2),
+            gridTop +
+                (targetRow * ((cellWidth * 1.42) + spacing)) +
+                ((cellWidth * 1.42) / 2),
+          );
+          final startCenter = Offset(maxWidth / 2, maxHeight * 0.30);
+          final flyProgress = Curves.easeInOutCubic.transform(
+            ((_controller.value - 0.16) / 0.56).clamp(0.0, 1.0),
+          );
+          final flyingCenter = Offset.lerp(
+            startCenter,
+            targetCenter,
+            flyProgress,
+          )!;
+          final cardWidth = cellWidth * 2.35 * _cardScale.value;
+          final cardHeight = (cellWidth * 1.42) * 2.35 * _cardScale.value;
+
+          return SafeArea(
+            child: AnimatedBuilder(
+              animation: _controller,
+              builder: (context, _) {
+                return Stack(
+                  children: [
+                    Positioned.fill(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              const Color(0xFF130A2A),
+                              const Color(0xFF101B42),
+                              const Color(0xFF07101E),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: -40,
+                      top: 40,
+                      child: IgnorePointer(
+                        child: Container(
+                          width: 220,
+                          height: 220,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: RadialGradient(
+                              colors: [
+                                accentColor.withOpacity(0.18),
+                                Colors.transparent,
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      right: -30,
+                      top: maxHeight * 0.18,
+                      child: IgnorePointer(
+                        child: Container(
+                          width: 180,
+                          height: 180,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            gradient: RadialGradient(
+                              colors: [
+                                const Color(0xFF8B5CF6).withOpacity(0.16),
+                                Colors.transparent,
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: Opacity(
+                          opacity: 0.07,
+                          child: CustomPaint(
+                            painter: _CollectionGridPatternPainter(),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 24,
+                      right: 24,
+                      top: 26,
+                      child: Opacity(
+                        opacity: _gridReveal.value,
+                        child: Column(
+                          children: [
+                            Text(
+                              'Registered to Pokédex',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.96),
+                                fontSize: 26,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 0.2,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              '$setName  •  Slot #$_targetSlot',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.74),
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '$ownedCount owned in this set',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.58),
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: gridLeft,
+                      top: gridTop - 18,
+                      child: Opacity(
+                        opacity: _gridReveal.value,
+                        child: Container(
+                          width: gridWidth,
+                          padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(24),
+                            color: const Color(0xFF0D1732).withOpacity(0.88),
+                            border: Border.all(
+                              color: Colors.white.withOpacity(0.10),
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.26),
+                                blurRadius: 28,
+                                offset: const Offset(0, 16),
+                              ),
+                            ],
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Container(
+                                    width: 11,
+                                    height: 11,
+                                    decoration: BoxDecoration(
+                                      color: accentColor,
+                                      shape: BoxShape.circle,
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: accentColor.withOpacity(0.34),
+                                          blurRadius: 12,
+                                          spreadRadius: 1,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      setName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 14),
+                              SizedBox(
+                                width: gridWidth - 28,
+                                height: gridHeight,
+                                child: GridView.builder(
+                                  physics: const NeverScrollableScrollPhysics(),
+                                  gridDelegate:
+                                      const SliverGridDelegateWithFixedCrossAxisCount(
+                                        crossAxisCount: _gridColumns,
+                                        mainAxisSpacing: 10,
+                                        crossAxisSpacing: 10,
+                                        childAspectRatio: 0.70,
+                                      ),
+                                  itemCount: visibleSlots.length,
+                                  itemBuilder: (context, index) {
+                                    final slot = visibleSlots[index];
+                                    final isTarget = slot == _targetSlot;
+                                    final ownedCard = ownedMap[slot];
+                                    final preview = previewMap[slot];
+                                    final ownedBeforeScan =
+                                        ownedCard != null && !isTarget;
+                                    final filledAfterImpact =
+                                        isTarget && _hasImpacted;
+
+                                    return _gridSlot(
+                                      slot: slot,
+                                      isOwnedBeforeScan: ownedBeforeScan,
+                                      isTargetSlot: isTarget,
+                                      isFilledAfterImpact: filledAfterImpact,
+                                      preview: preview,
+                                      ownedCard: isTarget
+                                          ? widget.card
+                                          : ownedCard,
+                                      accentColor: accentColor,
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (!_hasImpacted)
+                      Positioned(
+                        left: flyingCenter.dx - (cardWidth / 2),
+                        top: flyingCenter.dy - (cardHeight / 2),
+                        child: Transform.rotate(
+                          angle: _cardTurn.value,
+                          child: Container(
+                            width: cardWidth,
+                            height: cardHeight,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(18),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: accentColor.withOpacity(0.24),
+                                  blurRadius: 24,
+                                  offset: const Offset(0, 12),
+                                ),
+                              ],
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(18),
+                              child: url.isEmpty
+                                  ? Container(
+                                      color: const Color(0xFF1F1F1F),
+                                      alignment: Alignment.center,
+                                      child: const Icon(Icons.style, size: 44),
+                                    )
+                                  : Image.network(url, fit: BoxFit.cover),
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _CollectionGridPatternPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withOpacity(0.06)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    const gap = 36.0;
+
+    for (double x = 0; x < size.width; x += gap) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    }
+    for (double y = 0; y < size.height; y += gap) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
 class PokedexRegisteredOverlay extends StatefulWidget {
-  const PokedexRegisteredOverlay({super.key});
+  final PokedexEvent event;
+  final VoidCallback onComplete;
+
+  const PokedexRegisteredOverlay({
+    super.key,
+    required this.event,
+    required this.onComplete,
+  });
 
   @override
   State<PokedexRegisteredOverlay> createState() =>
@@ -2757,8 +3637,7 @@ class _PokedexRegisteredOverlayState extends State<PokedexRegisteredOverlay>
   late final AnimationController _controller;
   late final Animation<double> _fade;
   late final Animation<double> _scale;
-
-  PokedexEvent? _event;
+  bool _didComplete = false;
 
   @override
   void initState() {
@@ -2805,32 +3684,24 @@ class _PokedexRegisteredOverlayState extends State<PokedexRegisteredOverlay>
       TweenSequenceItem(tween: ConstantTween<double>(1.0), weight: 42),
     ]).animate(_controller);
 
-    collectionStore.lastPokedexEvent.addListener(_onPokedexEvent);
-  }
-
-  void _onPokedexEvent() {
-    final e = collectionStore.lastPokedexEvent.value;
-    if (e == null) return;
-
-    setState(() {
-      _event = e;
+    _controller.addStatusListener((status) {
+      if (status == AnimationStatus.completed && !_didComplete) {
+        _didComplete = true;
+        widget.onComplete();
+      }
     });
-
-    _controller.forward(from: 0);
+    _controller.forward();
   }
 
   @override
   void dispose() {
-    collectionStore.lastPokedexEvent.removeListener(_onPokedexEvent);
     _controller.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_event == null) return const SizedBox.shrink();
-
-    final imageUrl = _event!.imageUrl;
+    final imageUrl = widget.event.imageUrl;
 
     return IgnorePointer(
       child: FadeTransition(
@@ -2933,7 +3804,7 @@ class _PokedexRegisteredOverlayState extends State<PokedexRegisteredOverlay>
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    _event!.cardName,
+                    widget.event.cardName,
                     textAlign: TextAlign.center,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
@@ -3171,354 +4042,1083 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final level = collectionStore.level;
-    final streak = collectionStore.streak;
-    final cards = collectionStore.count;
-
     return Scaffold(
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-          children: [
-            Row(
-              children: [
-                Container(
-                  width: 46,
-                  height: 46,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(14),
-                    gradient: LinearGradient(
-                      colors: [
-                        Colors.white.withOpacity(0.14),
-                        Colors.white.withOpacity(0.04),
-                      ],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    border: Border.all(color: Colors.white.withOpacity(0.10)),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compactSpacing = constraints.maxHeight < 760;
+            final verticalGap = compactSpacing ? 11.0 : 15.0;
+            return AnimatedBuilder(
+              animation: collectionStore,
+              builder: (context, _) {
+                final level = collectionStore.level;
+                final streak = collectionStore.streak;
+                final cards = collectionStore.count;
+                final xpInto = collectionStore.xpIntoLevel;
+                final xpProgress = collectionStore.levelProgress.clamp(
+                  0.0,
+                  1.0,
+                );
+                final nextGoal = _resolveNextGoal();
+
+                return Padding(
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    compactSpacing ? 10 : 14,
+                    16,
+                    compactSpacing ? 8 : 12,
                   ),
-                  child: const Icon(Icons.style_outlined),
-                ),
-                const SizedBox(width: 12),
-                const Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        'CardScan',
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w900,
-                          letterSpacing: 0.2,
-                        ),
-                      ),
-                      SizedBox(height: 2),
-                      Text(
-                        'Scan. Register. Complete.',
-                        style: TextStyle(
-                          color: Colors.white70,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                StreamBuilder<User?>(
-                  stream: FirebaseAuth.instance.authStateChanges(),
-                  initialData: FirebaseAuth.instance.currentUser,
-                  builder: (context, snapshot) {
-                    final user = snapshot.data;
-                    if (user == null || user.isAnonymous) {
-                      return Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.end,
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          OutlinedButton.icon(
-                            onPressed: () =>
-                                _handleAuthAction(context, user: user),
-                            icon: Icon(_accountActionIcon(user)),
-                            label: Text(_accountActionLabel(user)),
+                          Container(
+                            width: 42,
+                            height: 42,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(14),
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.white.withOpacity(0.14),
+                                  Colors.white.withOpacity(0.05),
+                                ],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              ),
+                              border: Border.all(
+                                color: Colors.white.withOpacity(0.10),
+                              ),
+                            ),
+                            child: const Icon(Icons.style_outlined, size: 21),
                           ),
-                          const SizedBox(height: 8),
-                          FilledButton(
-                            onPressed: () => _startCreateAccountFlow(context),
-                            child: const Text('Create account'),
+                          const SizedBox(width: 12),
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'CardScan',
+                                  style: TextStyle(
+                                    fontSize: 21,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: 0.2,
+                                  ),
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  'Scan. Register. Complete.',
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                          const SizedBox(height: 8),
-                          OutlinedButton(
-                            onPressed: () => _startSignInFlow(context),
-                            child: const Text('Sign in'),
+                          const SizedBox(width: 10),
+                          StreamBuilder<User?>(
+                            stream: FirebaseAuth.instance.authStateChanges(),
+                            initialData: FirebaseAuth.instance.currentUser,
+                            builder: (context, snapshot) {
+                              final user = snapshot.data;
+                              if (user == null || user.isAnonymous) {
+                                return ConstrainedBox(
+                                  constraints: const BoxConstraints(
+                                    maxWidth: 150,
+                                  ),
+                                  child: Wrap(
+                                    alignment: WrapAlignment.end,
+                                    runSpacing: 6,
+                                    spacing: 6,
+                                    children: [
+                                      OutlinedButton.icon(
+                                        onPressed: () => _handleAuthAction(
+                                          context,
+                                          user: user,
+                                        ),
+                                        icon: Icon(
+                                          _accountActionIcon(user),
+                                          size: 16,
+                                        ),
+                                        label: Text(_accountActionLabel(user)),
+                                        style: OutlinedButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 10,
+                                            vertical: 10,
+                                          ),
+                                          visualDensity: VisualDensity.compact,
+                                        ),
+                                      ),
+                                      FilledButton(
+                                        onPressed: () =>
+                                            _startCreateAccountFlow(context),
+                                        style: FilledButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 10,
+                                            vertical: 10,
+                                          ),
+                                          visualDensity: VisualDensity.compact,
+                                        ),
+                                        child: const Text('Create account'),
+                                      ),
+                                      OutlinedButton(
+                                        onPressed: () =>
+                                            _startSignInFlow(context),
+                                        style: OutlinedButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 10,
+                                            vertical: 10,
+                                          ),
+                                          visualDensity: VisualDensity.compact,
+                                        ),
+                                        child: const Text('Sign in'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }
+
+                              return OutlinedButton.icon(
+                                onPressed: () =>
+                                    _handleAuthAction(context, user: user),
+                                icon: Icon(_accountActionIcon(user), size: 18),
+                                label: Text(_accountActionLabel(user)),
+                                style: OutlinedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 10,
+                                  ),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              );
+                            },
                           ),
                         ],
-                      );
-                    }
-
-                    return OutlinedButton.icon(
-                      onPressed: () => _handleAuthAction(context, user: user),
-                      icon: Icon(_accountActionIcon(user)),
-                      label: Text(_accountActionLabel(user)),
-                    );
-                  },
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 18),
-
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(22),
-                gradient: LinearGradient(
-                  colors: [
-                    Colors.white.withOpacity(0.06),
-                    Colors.white.withOpacity(0.02),
-                  ],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                border: Border.all(color: Colors.white.withOpacity(0.08)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Your collector dashboard',
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.92),
-                      fontSize: 18,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Scan cards, fill your Pokédex, and build complete sets one card at a time.',
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.78),
-                      height: 1.35,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 18),
-
-            FutureBuilder<FeaturedCardData?>(
-              future: _future,
-              builder: (context, snap) {
-                if (snap.connectionState != ConnectionState.done) {
-                  return Container(
-                    height: 180,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(24),
-                      color: Colors.white.withOpacity(0.05),
-                      border: Border.all(color: Colors.white.withOpacity(0.08)),
-                    ),
-                  );
-                }
-
-                if (snap.hasError) {
-                  return Container(
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(24),
-                      color: Colors.white.withOpacity(0.05),
-                      border: Border.all(color: Colors.white.withOpacity(0.08)),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.cloud_off, color: Colors.white70),
-                        const SizedBox(width: 10),
-                        const Expanded(
-                          child: Text(
-                            'Card of the Day unavailable.',
-                            style: TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      SizedBox(height: verticalGap),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text.rich(
+                              TextSpan(
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.90),
+                                  fontWeight: FontWeight.w700,
+                                  fontSize: 14,
+                                ),
+                                children: [
+                                  TextSpan(text: 'Level $level'),
+                                  const TextSpan(text: '  •  '),
+                                  TextSpan(text: '$cards cards'),
+                                  const TextSpan(text: '  •  '),
+                                  WidgetSpan(
+                                    alignment: PlaceholderAlignment.middle,
+                                    child: Padding(
+                                      padding: const EdgeInsets.only(right: 4),
+                                      child: Icon(
+                                        Icons.local_fire_department,
+                                        color: Colors.orange.shade300,
+                                        size: 15,
+                                      ),
+                                    ),
+                                  ),
+                                  TextSpan(text: '$streak day streak'),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(999),
+                              child: LinearProgressIndicator(
+                                value: xpProgress,
+                                minHeight: 7,
+                                backgroundColor: Colors.white.withOpacity(0.07),
+                                valueColor: AlwaysStoppedAnimation<Color>(
+                                  Colors.lightBlueAccent.shade100,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 5),
+                            Text(
+                              '$xpInto / 500 XP toward Level ${level + 1}',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.60),
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      SizedBox(height: verticalGap),
+                      InkWell(
+                        borderRadius: BorderRadius.circular(20),
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) =>
+                                  ScanScreen(cameras: widget.cameras),
+                            ),
+                          );
+                        },
+                        child: Ink(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 16,
+                          ),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(20),
+                            gradient: const LinearGradient(
+                              colors: [Color(0xFF7AE3FF), Color(0xFF3A7BFF)],
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(
+                                  0xFF3A7BFF,
+                                ).withOpacity(0.34),
+                                blurRadius: 24,
+                                spreadRadius: -4,
+                                offset: const Offset(0, 12),
+                              ),
+                            ],
+                          ),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 46,
+                                height: 46,
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withOpacity(0.16),
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(
+                                    color: Colors.white.withOpacity(0.18),
+                                  ),
+                                ),
+                                child: const Icon(
+                                  Icons.camera_alt_rounded,
+                                  color: Colors.white,
+                                  size: 24,
+                                ),
+                              ),
+                              const SizedBox(width: 14),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Scan your next card',
+                                      style: TextStyle(
+                                        color: Colors.white.withOpacity(0.98),
+                                        fontSize: 20,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 3),
+                                    Text(
+                                      'Fast camera scan for your collection',
+                                      style: TextStyle(
+                                        color: Colors.white.withOpacity(0.82),
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              const Icon(
+                                Icons.arrow_forward_rounded,
+                                color: Colors.white,
+                              ),
+                            ],
                           ),
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.refresh),
-                          onPressed: _reloadFeatured,
+                      ),
+                      const SizedBox(height: 6),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const ManualSearchScreen(),
+                              ),
+                            );
+                          },
+                          icon: const Icon(Icons.search, size: 18),
+                          label: const Text('Search manually'),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white.withOpacity(0.88),
+                            backgroundColor: Colors.white.withOpacity(0.035),
+                            side: BorderSide(
+                              color: Colors.white.withOpacity(0.14),
+                            ),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 11,
+                            ),
+                            visualDensity: VisualDensity.compact,
+                            textStyle: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                            ),
+                            alignment: Alignment.centerLeft,
+                          ),
                         ),
-                      ],
-                    ),
-                  );
-                }
+                      ),
+                      SizedBox(height: verticalGap),
+                      Expanded(
+                        child: FutureBuilder<FeaturedCardData?>(
+                          future: _future,
+                          builder: (context, featuredSnap) {
+                            final setStrip = _resolveSetInProgressStrip(
+                              featured: featuredSnap.data,
+                            );
+                            final hasSetRoute = setStrip.setKey.isNotEmpty;
+                            if (hasSetRoute) {
+                              _primeSetInProgressSet(setStrip);
+                            }
+                            final ownedMap = hasSetRoute
+                                ? collectionStore.ownedSlotMapViewForSet(
+                                    setStrip.setKey,
+                                  )
+                                : const <int, PokemonCardResult>{};
+                            final previewMap = hasSetRoute
+                                ? collectionStore.previewSlotMapViewForSet(
+                                    setStrip.setKey,
+                                  )
+                                : const <int, PreviewCard>{};
+                            final stripSlots = _resolveSetInProgressSlots(
+                              strip: setStrip,
+                              ownedMap: ownedMap,
+                              previewMap: previewMap,
+                              maxSlots: compactSpacing ? 5 : 6,
+                            );
 
-                final featured = snap.data;
-                if (featured == null) return const SizedBox.shrink();
-
-                return _FeaturedHeroCard(featured: featured);
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _buildSetInProgressStrip(
+                                  strip: setStrip,
+                                  slots: stripSlots,
+                                  compactSpacing: compactSpacing,
+                                ),
+                                SizedBox(
+                                  height: compactSpacing ? 6 : 10,
+                                ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 13,
+                                    vertical: 11,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withOpacity(0.04),
+                                    borderRadius: BorderRadius.circular(15),
+                                    border: Border.all(
+                                      color: Colors.white.withOpacity(0.06),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Container(
+                                        width: 34,
+                                        height: 34,
+                                        decoration: BoxDecoration(
+                                          color: Colors.white.withOpacity(0.06),
+                                          borderRadius:
+                                              BorderRadius.circular(11),
+                                        ),
+                                        child: const Icon(
+                                          Icons.auto_awesome,
+                                          color: Colors.white70,
+                                          size: 18,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 11),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              'Next goal',
+                                              style: TextStyle(
+                                                color: Colors.white.withOpacity(
+                                                  0.58,
+                                                ),
+                                                fontSize: 10.5,
+                                                fontWeight: FontWeight.w800,
+                                                letterSpacing: 0.6,
+                                              ),
+                                            ),
+                                            const SizedBox(height: 3),
+                                            Text(
+                                              nextGoal,
+                                              style: TextStyle(
+                                                color: Colors.white.withOpacity(
+                                                  0.90,
+                                                ),
+                                                fontSize: 13.5,
+                                                fontWeight: FontWeight.w700,
+                                                height: 1.2,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                SizedBox(
+                                  height: compactSpacing ? 6 : 10,
+                                ),
+                                Expanded(
+                                  child: Align(
+                                    alignment: Alignment.bottomCenter,
+                                    child: _buildHomeFeaturedCard(featuredSnap),
+                                  ),
+                                ),
+                              ],
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                );
               },
-            ),
-
-            const SizedBox(height: 18),
-
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(24),
-                gradient: LinearGradient(
-                  colors: [
-                    Colors.black.withOpacity(0.28),
-                    Colors.black.withOpacity(0.16),
-                  ],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                border: Border.all(color: Colors.white.withOpacity(0.08)),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.18),
-                    blurRadius: 18,
-                    offset: const Offset(0, 10),
-                  ),
-                ],
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Text(
-                        'Collector status',
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.92),
-                          fontSize: 18,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                      const Spacer(),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.08),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          'Level $level',
-                          style: const TextStyle(fontWeight: FontWeight.w800),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 14),
-                  Row(
-                    children: [
-                      Expanded(child: _bigStat('Level', '$level')),
-                      Expanded(child: _bigStat('Streak', '$streak')),
-                      Expanded(child: _bigStat('Cards', '$cards')),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 18),
-
-            Row(
-              children: [
-                Expanded(
-                  child: _ActionPanelButton(
-                    icon: Icons.camera_alt_outlined,
-                    title: 'Scan your card',
-                    subtitle: 'Fast camera scan',
-                    filled: true,
-                    onTap: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => ScanScreen(cameras: widget.cameras),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _ActionPanelButton(
-                    icon: Icons.search,
-                    title: 'Search manually',
-                    subtitle: 'Find by name/set',
-                    filled: false,
-                    onTap: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => const ManualSearchScreen(),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 16),
-
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.05),
-                borderRadius: BorderRadius.circular(18),
-                border: Border.all(color: Colors.white.withOpacity(0.06)),
-              ),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    Icons.lightbulb_outline,
-                    color: Colors.amber.shade300,
-                    size: 20,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      'Tip: Manual search works best when scanning is blurry or the set/number is missing.',
-                      style: TextStyle(
-                        color: Colors.white.withOpacity(0.78),
-                        height: 1.35,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
+            );
+          },
         ),
       ),
     );
   }
 
-  Widget _bigStat(String label, String value) {
+  _HomeSetStripData _resolveSetInProgressStrip({
+    required FeaturedCardData? featured,
+  }) {
+    final summaries = collectionStore.getSetSummariesView();
+    SetSummary? bestIncomplete;
+    for (final summary in summaries) {
+      final printedTotal = summary.printedTotal ?? 0;
+      final isIncomplete =
+          printedTotal <= 0 || summary.ownedUniqueSlots < printedTotal;
+      if (!isIncomplete) continue;
+      if (bestIncomplete == null ||
+          summary.ownedUniqueSlots > bestIncomplete.ownedUniqueSlots) {
+        bestIncomplete = summary;
+      }
+    }
+
+    final target = bestIncomplete ?? (summaries.isNotEmpty ? summaries.first : null);
+    if (target != null) {
+      return _HomeSetStripData(
+        setKey: target.setKey,
+        setName: target.setName,
+        printedTotal: target.printedTotal,
+        focalSlot: _mostRecentSlotForSet(target.setKey),
+        ownedCount: target.ownedUniqueSlots,
+      );
+    }
+
+    final featuredCard = featured?.card;
+    final featuredSetKey = featuredCard?.setId.trim() ?? '';
+    final featuredSetName = featuredCard?.setName.trim() ?? '';
+    if (featuredSetKey.isNotEmpty && featuredSetName.isNotEmpty) {
+      return _HomeSetStripData(
+        setKey: featuredSetKey,
+        setName: featuredSetName,
+        printedTotal: featuredCard?.setPrintedTotal,
+        focalSlot: _parseSlotNumber(featuredCard?.number ?? ''),
+        ownedCount: 0,
+      );
+    }
+
+    return const _HomeSetStripData(
+      setKey: '',
+      setName: 'Your first set',
+      printedTotal: 6,
+      focalSlot: 1,
+      ownedCount: 0,
+    );
+  }
+
+  int? _mostRecentSlotForSet(String setKey) {
+    final entries = collectionStore.itemsForSet(setKey);
+    for (final entry in entries) {
+      final slot = _parseSlotNumber(entry.card.number);
+      if (slot != null) return slot;
+    }
+    return null;
+  }
+
+  int? _parseSlotNumber(String raw) {
+    final digits = raw.replaceAll(RegExp(r'[^0-9]'), '');
+    if (digits.isEmpty) return null;
+    return int.tryParse(digits);
+  }
+
+  void _primeSetInProgressSet(_HomeSetStripData strip) {
+    if (strip.setKey.isEmpty || collectionStore.hasSetIndex(strip.setKey)) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(
+        collectionStore.ensureSetIndexLoaded(
+          setKey: strip.setKey,
+          setId: strip.setKey,
+        ),
+      );
+    });
+  }
+
+  List<_HomeSetStripSlot> _resolveSetInProgressSlots({
+    required _HomeSetStripData strip,
+    required Map<int, PokemonCardResult> ownedMap,
+    required Map<int, PreviewCard> previewMap,
+    required int maxSlots,
+  }) {
+    final total = _resolveSetInProgressTotal(
+      strip: strip,
+      ownedMap: ownedMap,
+      previewMap: previewMap,
+      minimumSlots: maxSlots,
+    );
+    final window = _resolveSetInProgressWindow(
+      total: total,
+      ownedSlots: ownedMap.keys.toList()..sort(),
+      focalSlot: strip.focalSlot,
+      desiredSlots: maxSlots,
+    );
+    return window
+        .map(
+          (slot) => _HomeSetStripSlot(
+            slot: slot,
+            owned: ownedMap[slot],
+            preview: previewMap[slot],
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  int _resolveSetInProgressTotal({
+    required _HomeSetStripData strip,
+    required Map<int, PokemonCardResult> ownedMap,
+    required Map<int, PreviewCard> previewMap,
+    required int minimumSlots,
+  }) {
+    var total = strip.printedTotal ?? 0;
+    for (final slot in ownedMap.keys) {
+      if (slot > total) total = slot;
+    }
+    for (final slot in previewMap.keys) {
+      if (slot > total) total = slot;
+    }
+    final focalSlot = strip.focalSlot ?? 0;
+    if (focalSlot > total) total = focalSlot;
+    if (total < minimumSlots) total = minimumSlots;
+    if (total > 500) return 500;
+    return total;
+  }
+
+  List<int> _resolveSetInProgressWindow({
+    required int total,
+    required List<int> ownedSlots,
+    required int? focalSlot,
+    required int desiredSlots,
+  }) {
+    final visibleCount = total < desiredSlots ? total : desiredSlots;
+    final maxStart = total - visibleCount + 1;
+    if (visibleCount <= 0 || maxStart <= 0) return const <int>[];
+
+    if (ownedSlots.isEmpty) {
+      var start = (focalSlot ?? 1) - (visibleCount ~/ 2);
+      if (start < 1) start = 1;
+      if (start > maxStart) start = maxStart;
+      return List<int>.generate(visibleCount, (index) => start + index);
+    }
+
+    var bestStart = 1;
+    var bestOwnedCount = -1;
+    var bestDistanceScore = 1 << 30;
+
+    for (var start = 1; start <= maxStart; start++) {
+      final end = start + visibleCount - 1;
+      final center = start + ((visibleCount - 1) / 2.0);
+      var ownedCount = 0;
+      var distanceScore = 0;
+
+      for (final slot in ownedSlots) {
+        if (slot < start || slot > end) continue;
+        ownedCount += 1;
+        distanceScore += ((slot - center).abs() * 100).round();
+      }
+
+      final shouldTake = ownedCount > bestOwnedCount ||
+          (ownedCount == bestOwnedCount &&
+              distanceScore < bestDistanceScore);
+      if (!shouldTake) continue;
+      bestStart = start;
+      bestOwnedCount = ownedCount;
+      bestDistanceScore = distanceScore;
+    }
+
+    return List<int>.generate(visibleCount, (index) => bestStart + index);
+  }
+
+  void _openSetInProgress(_HomeSetStripData strip) {
+    if (strip.setKey.isEmpty) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const CollectionScreen()),
+      );
+      return;
+    }
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        settings: const RouteSettings(name: 'set_pokedex'),
+        builder: (_) => SetPokedexScreen(
+          setKey: strip.setKey,
+          setName: strip.setName,
+          printedTotal: strip.printedTotal,
+        ),
+      ),
+    );
+  }
+
+  void _openSetInProgressSlot({
+    required _HomeSetStripData strip,
+    required _HomeSetStripSlot slot,
+  }) {
+    if (strip.setKey.isEmpty) {
+      _openSetInProgress(strip);
+      return;
+    }
+
+    if (slot.owned != null) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => OwnedCardShowcaseScreen(card: slot.owned!),
+        ),
+      );
+      return;
+    }
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => LockedCardShowcaseScreen(
+          slot: slot.slot,
+          preview: slot.preview,
+          setKey: strip.setKey,
+          setName: strip.setName,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSetInProgressStrip({
+    required _HomeSetStripData strip,
+    required List<_HomeSetStripSlot> slots,
+    required bool compactSpacing,
+  }) {
+    final canOpenSet = strip.setKey.isNotEmpty;
+    final progressText = strip.printedTotal != null && strip.printedTotal! > 0
+        ? '${strip.ownedCount}/${strip.printedTotal}'
+        : '${strip.ownedCount} collected';
+
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 4),
-      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 12),
+      padding: EdgeInsets.fromLTRB(
+        14,
+        compactSpacing ? 12 : 14,
+        14,
+        compactSpacing ? 10 : 12,
+      ),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.04),
+        color: Colors.white.withOpacity(0.045),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Colors.white.withOpacity(0.06)),
+        border: Border.all(color: Colors.white.withOpacity(0.07)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            label,
-            style: const TextStyle(fontSize: 12, color: Colors.white70),
+          Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: () => _openSetInProgress(strip),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Set in progress',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.62),
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 0.7,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          strip.setName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          progressText,
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.68),
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: () => _openSetInProgress(strip),
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.white.withOpacity(0.90),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  visualDensity: VisualDensity.compact,
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      canOpenSet ? 'View set' : 'View all',
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(width: 2),
+                    const Icon(Icons.chevron_right_rounded, size: 18),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 8),
-          Text(
-            value,
-            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900),
+          const SizedBox(height: 10),
+          SizedBox(
+            height: compactSpacing ? 102 : 110,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (var i = 0; i < slots.length; i++) ...[
+                    _buildSetInProgressSlotTile(
+                      strip: strip,
+                      slot: slots[i],
+                      compactSpacing: compactSpacing,
+                    ),
+                    if (i != slots.length - 1) const SizedBox(width: 10),
+                  ],
+                ],
+              ),
+            ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildSetInProgressSlotTile({
+    required _HomeSetStripData strip,
+    required _HomeSetStripSlot slot,
+    required bool compactSpacing,
+  }) {
+    final imageUrl = slot.imageUrl;
+    final showImage = imageUrl.startsWith('http://') || imageUrl.startsWith('https://');
+    final cardWidth = compactSpacing ? 54.0 : 58.0;
+    final cardHeight = compactSpacing ? 76.0 : 82.0;
+    final isOwned = slot.owned != null;
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: () => _openSetInProgressSlot(strip: strip, slot: slot),
+        child: SizedBox(
+          width: cardWidth,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: cardWidth,
+                height: cardHeight,
+                child: Stack(
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(14),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: isOwned
+                                ? const [
+                                    Color(0xFF173158),
+                                    Color(0xFF0B1528),
+                                  ]
+                                : const [
+                                    Color(0xFF1B2433),
+                                    Color(0xFF111827),
+                                  ],
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                          ),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(
+                              isOwned ? 0.14 : 0.08,
+                            ),
+                          ),
+                        ),
+                        child: showImage
+                            ? _buildSetInProgressSlotImage(
+                                imageUrl: imageUrl,
+                                isOwned: isOwned,
+                              )
+                            : _buildSetInProgressSlotPlaceholder(isOwned: isOwned),
+                      ),
+                    ),
+                    if (!isOwned)
+                      Positioned.fill(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(14),
+                            color: Colors.black.withOpacity(0.28),
+                          ),
+                        ),
+                      ),
+                    if (isOwned)
+                      Positioned(
+                        top: 5,
+                        right: 5,
+                        child: Container(
+                          width: 18,
+                          height: 18,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF81E6A8),
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.24),
+                                blurRadius: 8,
+                                offset: const Offset(0, 3),
+                              ),
+                            ],
+                          ),
+                          child: const Icon(
+                            Icons.check_rounded,
+                            size: 12,
+                            color: Color(0xFF112016),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '#${slot.slot}',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  color: Colors.white.withOpacity(isOwned ? 0.92 : 0.60),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSetInProgressSlotImage({
+    required String imageUrl,
+    required bool isOwned,
+  }) {
+    final image = Image.network(
+      imageUrl,
+      fit: BoxFit.cover,
+      errorBuilder: (_, __, ___) =>
+          _buildSetInProgressSlotPlaceholder(isOwned: isOwned),
+    );
+    if (isOwned) return image;
+
+    return ColorFiltered(
+      colorFilter: const ColorFilter.matrix(<double>[
+        0.2126,
+        0.7152,
+        0.0722,
+        0,
+        0,
+        0.2126,
+        0.7152,
+        0.0722,
+        0,
+        0,
+        0.2126,
+        0.7152,
+        0.0722,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+      ]),
+      child: image,
+    );
+  }
+
+  Widget _buildSetInProgressSlotPlaceholder({required bool isOwned}) {
+    return Center(
+      child: Icon(
+        isOwned ? Icons.style_outlined : Icons.image_not_supported_outlined,
+        size: 22,
+        color: Colors.white.withOpacity(isOwned ? 0.76 : 0.42),
+      ),
+    );
+  }
+
+  Widget _buildHomeFeaturedCard(AsyncSnapshot<FeaturedCardData?> snap) {
+    if (snap.connectionState != ConnectionState.done) {
+      return Container(
+        height: 98,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          color: Colors.white.withOpacity(0.03),
+          border: Border.all(color: Colors.white.withOpacity(0.06)),
+        ),
+      );
+    }
+
+    if (snap.hasError) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 13),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          color: Colors.white.withOpacity(0.03),
+          border: Border.all(color: Colors.white.withOpacity(0.06)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.cloud_off, color: Colors.white70, size: 18),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Card of the Day unavailable.',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: _reloadFeatured,
+            ),
+          ],
+        ),
+      );
+    }
+
+    final featured = snap.data;
+    if (featured == null) return const SizedBox.shrink();
+    return _FeaturedHeroCard(featured: featured);
+  }
+
+  String _resolveNextGoal() {
+    final summaries = collectionStore.getSetSummariesView();
+    if (summaries.isEmpty) {
+      return 'Add your first card to start building a set.';
+    }
+
+    SetSummary? target;
+    for (final summary in summaries) {
+      final printedTotal = summary.printedTotal ?? 0;
+      final hasKnownProgress =
+          printedTotal > 0 && summary.ownedUniqueSlots < printedTotal;
+      if (!hasKnownProgress) continue;
+      if (target == null) {
+        target = summary;
+        continue;
+      }
+
+      final targetScore = target.progress * 1000 + target.ownedUniqueSlots;
+      final currentScore = summary.progress * 1000 + summary.ownedUniqueSlots;
+      if (currentScore > targetScore) {
+        target = summary;
+      }
+    }
+
+    target ??= summaries.first;
+    final printedTotal = target.printedTotal ?? 0;
+    if (printedTotal <= 0) {
+      return 'Keep building ${target.setName}.';
+    }
+
+    final missing = (printedTotal - target.ownedUniqueSlots).clamp(0, 9999);
+    if (missing <= 1) {
+      return 'Complete ${target.setName} with 1 more card.';
+    }
+
+    final addCount = missing.clamp(1, 3).toInt();
+    final noun = addCount == 1 ? 'card' : 'cards';
+    return 'Add $addCount more $noun to ${target.setName}.';
+  }
+}
+
+class _HomeSetStripData {
+  final String setKey;
+  final String setName;
+  final int? printedTotal;
+  final int? focalSlot;
+  final int ownedCount;
+
+  const _HomeSetStripData({
+    required this.setKey,
+    required this.setName,
+    required this.printedTotal,
+    required this.focalSlot,
+    required this.ownedCount,
+  });
+}
+
+class _HomeSetStripSlot {
+  final int slot;
+  final PokemonCardResult? owned;
+  final PreviewCard? preview;
+
+  const _HomeSetStripSlot({
+    required this.slot,
+    required this.owned,
+    required this.preview,
+  });
+
+  String get imageUrl {
+    final ownedImage = owned?.imageSmall ?? owned?.imageLarge ?? '';
+    if (ownedImage.trim().isNotEmpty) return ownedImage;
+    final previewImage = preview?.imageSmall ?? preview?.imageLarge ?? '';
+    return previewImage.trim();
   }
 }
 
@@ -3538,7 +5138,7 @@ class _FeaturedHeroCard extends StatelessWidget {
     final hasImg = _isHttpUrl(img);
 
     return InkWell(
-      borderRadius: BorderRadius.circular(24),
+      borderRadius: BorderRadius.circular(18),
       onTap: () {
         Navigator.push(
           context,
@@ -3548,30 +5148,30 @@ class _FeaturedHeroCard extends StatelessWidget {
         );
       },
       child: Container(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(18),
           gradient: LinearGradient(
-            colors: [const Color(0xFF050816), const Color(0xFF0A0F2A)],
+            colors: [const Color(0xFF0A1220), const Color(0xFF10192B)],
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
           ),
-          border: Border.all(color: Colors.white.withOpacity(0.08)),
+          border: Border.all(color: Colors.white.withOpacity(0.05)),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.28),
-              blurRadius: 24,
-              offset: const Offset(0, 12),
+              color: Colors.black.withOpacity(0.14),
+              blurRadius: 14,
+              offset: const Offset(0, 8),
             ),
           ],
         ),
         child: Row(
           children: [
             ClipRRect(
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(10),
               child: SizedBox(
-                width: 110,
-                height: 150,
+                width: 50,
+                height: 70,
                 child: hasImg
                     ? Image.network(
                         img,
@@ -3581,15 +5181,16 @@ class _FeaturedHeroCard extends StatelessWidget {
                     : _fallbackCardArt(),
               ),
             ),
-            const SizedBox(width: 16),
+            const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Container(
                     padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 7,
+                      horizontal: 8,
+                      vertical: 4,
                     ),
                     decoration: BoxDecoration(
                       color: Colors.white.withOpacity(0.08),
@@ -3599,47 +5200,49 @@ class _FeaturedHeroCard extends StatelessWidget {
                     child: const Text(
                       'CARD OF THE DAY',
                       style: TextStyle(
-                        fontSize: 11,
+                        fontSize: 8,
                         fontWeight: FontWeight.w900,
-                        letterSpacing: 1.0,
+                        letterSpacing: 0.7,
                         color: Colors.white70,
                       ),
                     ),
                   ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 5),
                   Text(
                     c.name,
-                    maxLines: 2,
+                    maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                      fontSize: 20,
+                      fontSize: 16,
                       fontWeight: FontWeight.w900,
                     ),
                   ),
-                  const SizedBox(height: 6),
+                  const SizedBox(height: 1),
                   Text(
-                    '${c.setName} - #${c.number}',
+                    '${c.setName} • #${c.number}',
                     style: TextStyle(
-                      color: Colors.white.withOpacity(0.74),
+                      color: Colors.white.withOpacity(0.64),
+                      fontSize: 10,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 4),
                   Row(
                     children: [
                       const Icon(
                         Icons.local_fire_department,
-                        size: 16,
+                        size: 12,
                         color: Colors.orangeAccent,
                       ),
-                      const SizedBox(width: 6),
+                      const SizedBox(width: 4),
                       Expanded(
                         child: Text(
                           featured.meta.headline,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                            color: Colors.white70,
+                            color: Colors.white54,
+                            fontSize: 10,
                             fontWeight: FontWeight.w700,
                           ),
                         ),
@@ -3650,7 +5253,11 @@ class _FeaturedHeroCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 6),
-            const Icon(Icons.chevron_right, color: Colors.white70),
+            const Icon(
+              Icons.chevron_right_rounded,
+              color: Colors.white38,
+              size: 16,
+            ),
           ],
         ),
       ),
@@ -4546,6 +6153,8 @@ class SearchResultsScreen extends StatefulWidget {
   final List<PokemonCardResult>? prefetched;
   final bool browseOnly;
   final bool scannerFallback;
+  final String? expectedSetId;
+  final int? expectedSlot;
 
   const SearchResultsScreen({
     super.key,
@@ -4555,6 +6164,8 @@ class SearchResultsScreen extends StatefulWidget {
     this.prefetched,
     this.browseOnly = false,
     this.scannerFallback = false,
+    this.expectedSetId,
+    this.expectedSlot,
   });
 
   @override
@@ -4593,6 +6204,8 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
             MaterialPageRoute(
               builder: (_) => PokemonCardDetailsScreen(
                 card: c,
+                expectedSetId: widget.expectedSetId,
+                expectedSlot: widget.expectedSlot,
                 compactAddMode: widget.scannerFallback,
                 readOnly: widget.scannerFallback ? false : widget.browseOnly,
               ),
@@ -4781,6 +6394,8 @@ class _SearchResultsScreenState extends State<SearchResultsScreen> {
                         MaterialPageRoute(
                           builder: (_) => PokemonCardDetailsScreen(
                             card: c,
+                            expectedSetId: widget.expectedSetId,
+                            expectedSlot: widget.expectedSlot,
                             compactAddMode: widget.scannerFallback,
                             readOnly: widget.scannerFallback
                                 ? false
@@ -6605,7 +8220,9 @@ class LockedCardShowcaseScreen extends StatelessWidget {
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.06),
                         borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: Colors.white.withOpacity(0.08)),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.08),
+                        ),
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -6755,12 +8372,16 @@ class _PokedexRegisterAnimationScreenState
   }
 
   void _finishToShowcase() {
-    // Return to PokÃ©dex page, then open owned showcase
-    Navigator.popUntil(context, (r) => r.settings.name == 'set_pokedex');
-    Navigator.push(
+    Navigator.pushReplacement(
       context,
       MaterialPageRoute(
-        builder: (_) => OwnedCardShowcaseScreen(card: widget.card),
+        builder: (_) => PostScanOwnedShowcaseScreen(
+          card: widget.card,
+          returnTarget: _PostScanReturnTarget.setPokedex(
+            setKey: widget.setKey,
+            slot: widget.slot,
+          ),
+        ),
       ),
     );
   }
@@ -6985,7 +8606,10 @@ class _AddedToCollectionAnimationScreenState
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(
-        builder: (_) => OwnedCardShowcaseScreen(card: widget.card),
+        builder: (_) => PostScanOwnedShowcaseScreen(
+          card: widget.card,
+          returnTarget: const _PostScanReturnTarget.home(),
+        ),
       ),
     );
   }
@@ -8079,6 +9703,7 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
     final expectedSetId = widget.expectedSetId;
     final expectedSlot = widget.expectedSlot;
     final fromPokedex = expectedSetId != null && expectedSlot != null;
+    final fromScanAddFlow = fromPokedex || widget.compactAddMode;
 
     final already = collectionStore.containsCardId(card.id);
     if (already) {
@@ -8117,6 +9742,9 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
 
     final cardToSave = card;
 
+    if (fromScanAddFlow) {
+      _rewardOverlayGate.hold();
+    }
     collectionStore.addCard(cardToSave);
     unawaited(_enrichSavedCardMarketValue(cardToSave));
 
@@ -8137,9 +9765,15 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
     setState(() {});
 
     if (fromPokedex) {
-      Navigator.popUntil(
+      Navigator.pushReplacement(
         context,
-        (route) => route.settings.name == 'set_pokedex',
+        MaterialPageRoute(
+          builder: (_) => PokedexRegisterAnimationScreen(
+            card: cardToSave,
+            setKey: expectedSetId!,
+            slot: expectedSlot!,
+          ),
+        ),
       );
       return;
     }
@@ -8444,7 +10078,11 @@ class _PokemonCardDetailsScreenState extends State<PokemonCardDetailsScreen> {
                           Navigator.pushReplacement(
                             context,
                             MaterialPageRoute(
-                              builder: (_) => ScanScreen(cameras: gCameras),
+                              builder: (_) => ScanScreen(
+                                cameras: gCameras,
+                                expectedSetId: widget.expectedSetId,
+                                expectedSlot: widget.expectedSlot,
+                              ),
                             ),
                           );
                         },
@@ -8958,7 +10596,8 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
 
     final suffixDigits = RegExp(r'([0-9]{1,4})$').firstMatch(s);
     if (suffixDigits != null) {
-      return suffixDigits.group(1)!;
+      final parsed = int.tryParse(suffixDigits.group(1)!);
+      if (parsed != null && parsed > 0) return parsed.toString();
     }
 
     return '';
@@ -8980,7 +10619,9 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
     final n = (m.group(1) ?? '').trim();
     final t = (m.group(2) ?? '').trim();
     if (n.isEmpty || t.isEmpty) return null;
-    return (num: n, total: t);
+    final normalizedNum = int.tryParse(n)?.toString() ?? n;
+    final normalizedTotal = int.tryParse(t)?.toString() ?? t;
+    return (num: normalizedNum, total: normalizedTotal);
   }
 
   /* ----------------------------- main flow ----------------------------- */
@@ -8999,6 +10640,8 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
       final rawText = guess.rawText ?? '';
       final flat = _flattenRaw(rawText);
       final hp = guess.hp;
+      final setCode = (guess.setCode ?? '').trim().toUpperCase();
+      final setCodeSource = (guess.setCodeSource ?? '').trim();
 
       // ---------- NAME ----------
       final rawName = (guess.name ?? '').trim();
@@ -9089,8 +10732,19 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         'stage="${guess.stage ?? ''}" rawNumber="$rawNumber" '
         'parsedNumber="${numOnly ?? ''}" '
         'setTotal=${setTotalStr.isEmpty ? "null" : setTotalStr} '
+        'setCode="${setCode.isEmpty ? '' : setCode}" '
+        'setCodeSource="${setCodeSource.isEmpty ? '' : setCodeSource}" '
         'hp=${hp ?? 'null'} expectedSetId="${expectedSetId ?? ''}" '
         'expectedSlot=${expectedSlot ?? 'null'} svpDigits=${svpDigits ?? 'null'}',
+      );
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [recognizer-handoff] name="$usedName" '
+        'number="${numOnly ?? ''}" numberSource="${guess.numberSource ?? ''}" '
+        'setTotal="${setTotalStr.isEmpty ? '' : setTotalStr}" '
+        'setCode="${setCode.isEmpty ? '' : setCode}" '
+        'setCodeSource="${setCodeSource.isEmpty ? '' : setCodeSource}" '
+        'hp=${hp ?? 'null'} rawTextLen=${rawText.length}',
       );
 
       if (usedName.trim().isEmpty && (numOnly == null || numOnly!.isEmpty)) {
@@ -9108,6 +10762,8 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         numberSource: guess.numberSource,
         imagePath: widget.photoPath,
         setTotal: setTotalStr,
+        setCode: setCode.isEmpty ? null : setCode,
+        setCodeSource: setCodeSource.isEmpty ? null : setCodeSource,
         hp: hp,
         rawText: rawText,
         expectedSetId: expectedSetId,
@@ -9146,6 +10802,7 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
 
           final cardToSave = card;
 
+          _rewardOverlayGate.hold();
           collectionStore.addCard(cardToSave);
           unawaited(_enrichSavedCardMarketValue(cardToSave));
           collectionStore.emitCollected(
@@ -9193,8 +10850,12 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(
-            builder: (_) =>
-                PokemonCardDetailsScreen(card: card, compactAddMode: true),
+            builder: (_) => PokemonCardDetailsScreen(
+              card: card,
+              expectedSetId: widget.expectedSetId,
+              expectedSlot: widget.expectedSlot,
+              compactAddMode: true,
+            ),
           ),
         );
         return;
@@ -9260,6 +10921,8 @@ class _RecognizingScreenState extends State<RecognizingScreen> {
           prefetched: prefetched,
           browseOnly: false,
           scannerFallback: scannerFallback,
+          expectedSetId: widget.expectedSetId,
+          expectedSlot: widget.expectedSlot,
         ),
       ),
     );

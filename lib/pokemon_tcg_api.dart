@@ -38,6 +38,20 @@ class ReliablePick {
   });
 }
 
+class _ScannerSetClue {
+  final String code;
+  final String setId;
+  final String setName;
+  final int? printedTotal;
+
+  const _ScannerSetClue({
+    required this.code,
+    required this.setId,
+    required this.setName,
+    required this.printedTotal,
+  });
+}
+
 class TcgServiceUnavailable implements Exception {
   final String message;
   TcgServiceUnavailable(this.message);
@@ -56,6 +70,93 @@ class PokemonTcgApi {
       'https://poke-tcg-proxy.maximocran.workers.dev';
 
   static Box? _cacheBox;
+  static const Map<String, _ScannerSetClue> _trustedScannerSetCodes =
+      <String, _ScannerSetClue>{
+        'ASC': _ScannerSetClue(
+          code: 'ASC',
+          setId: 'asc',
+          setName: 'Ascended Heroes',
+          printedTotal: 217,
+        ),
+        'MEG': _ScannerSetClue(
+          code: 'MEG',
+          setId: 'meg',
+          setName: 'Mega Evolution',
+          printedTotal: 132,
+        ),
+        'PRE': _ScannerSetClue(
+          code: 'PRE',
+          setId: 'pre',
+          setName: 'Prismatic Evolutions',
+          printedTotal: 131,
+        ),
+        'SVI': _ScannerSetClue(
+          code: 'SVI',
+          setId: 'sv1',
+          setName: 'Scarlet & Violet',
+          printedTotal: 198,
+        ),
+        'PAL': _ScannerSetClue(
+          code: 'PAL',
+          setId: 'pal',
+          setName: 'Paldea Evolved',
+          printedTotal: 193,
+        ),
+        'OBF': _ScannerSetClue(
+          code: 'OBF',
+          setId: 'obf',
+          setName: 'Obsidian Flames',
+          printedTotal: 197,
+        ),
+        'MEW': _ScannerSetClue(
+          code: 'MEW',
+          setId: 'sv3pt5',
+          setName: '151',
+          printedTotal: 165,
+        ),
+        'PAR': _ScannerSetClue(
+          code: 'PAR',
+          setId: 'par',
+          setName: 'Paradox Rift',
+          printedTotal: 182,
+        ),
+        'TEF': _ScannerSetClue(
+          code: 'TEF',
+          setId: 'tef',
+          setName: 'Temporal Forces',
+          printedTotal: 162,
+        ),
+        'TWM': _ScannerSetClue(
+          code: 'TWM',
+          setId: 'twm',
+          setName: 'Twilight Masquerade',
+          printedTotal: 167,
+        ),
+        'SCR': _ScannerSetClue(
+          code: 'SCR',
+          setId: 'scr',
+          setName: 'Stellar Crown',
+          printedTotal: 175,
+        ),
+        'SSP': _ScannerSetClue(
+          code: 'SSP',
+          setId: 'ssp',
+          setName: 'Surging Sparks',
+          printedTotal: 191,
+        ),
+        'DRI': _ScannerSetClue(
+          code: 'DRI',
+          setId: 'dri',
+          setName: 'Destined Rivals',
+          printedTotal: 182,
+        ),
+        'SVP': _ScannerSetClue(
+          code: 'SVP',
+          setId: 'svp',
+          setName: 'Scarlet & Violet Black Star Promos',
+          printedTotal: null,
+        ),
+      };
 
   // One client for consistency (direct API only)
   late final IOClient _io = _makeClient();
@@ -259,6 +360,317 @@ class PokemonTcgApi {
     return n;
   }
 
+  String? _normalizeScannerSetCode(String? raw) {
+    if (raw == null) return null;
+    final normalized = raw
+        .toUpperCase()
+        .replaceAll('5', 'S')
+        .replaceAll('0', 'O')
+        .replaceAll('1', 'I')
+        .replaceAll(RegExp(r'[^A-Z0-9]'), '');
+    if (normalized.isEmpty) return null;
+    return normalized;
+  }
+
+  _ScannerSetClue? _resolveTrustedScannerSetClue({
+    String? setCode,
+    int? printedTotal,
+  }) {
+    final normalizedCode = _normalizeScannerSetCode(setCode);
+    if (normalizedCode != null) {
+      final byCode = _trustedScannerSetCodes[normalizedCode];
+      if (byCode != null) {
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [trusted-clue-resolve] inputSetCode="${setCode ?? ''}" '
+          'normalizedSetCode="$normalizedCode" printedTotal=${printedTotal ?? 'null'} '
+          'matchedBy="setCode" resultSetId="${byCode.setId}" '
+          'resultSetName="${byCode.setName}" resultPrintedTotal=${byCode.printedTotal ?? 'null'}',
+        );
+        return byCode;
+      }
+    }
+
+    if (printedTotal == null) return null;
+    for (final clue in _trustedScannerSetCodes.values) {
+      if (clue.printedTotal == printedTotal) {
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [trusted-clue-resolve] inputSetCode="${setCode ?? ''}" '
+          'normalizedSetCode="${normalizedCode ?? ''}" printedTotal=$printedTotal '
+          'matchedBy="printedTotal" resultSetId="${clue.setId}" '
+          'resultSetName="${clue.setName}" resultPrintedTotal=${clue.printedTotal ?? 'null'}',
+        );
+        return clue;
+      }
+    }
+    // ignore: avoid_print
+    print(
+      'SCAN DEBUG [trusted-clue-resolve] inputSetCode="${setCode ?? ''}" '
+      'normalizedSetCode="${normalizedCode ?? ''}" printedTotal=${printedTotal ?? 'null'} '
+      'matchedBy="none"',
+    );
+    return null;
+  }
+
+  bool _cardMatchesTrustedSetClue(PokemonCardResult card, _ScannerSetClue clue) {
+    final cardSetId = card.setId.trim().toLowerCase();
+    final cardSetName = card.setName.trim().toLowerCase();
+    return cardSetId == clue.setId.toLowerCase() ||
+        cardSetName == clue.setName.toLowerCase();
+  }
+
+  bool _hasExplicitTrustedSetCode(String? setCode) {
+    final normalized = _normalizeScannerSetCode(setCode);
+    return normalized != null && _trustedScannerSetCodes.containsKey(normalized);
+  }
+
+  bool _cardMatchesTrustedCollectorNumber(
+    PokemonCardResult card,
+    String normalizedNumber,
+  ) {
+    final cardNumber = _cleanCollectorNumber(card.number);
+    return cardNumber != null && cardNumber == normalizedNumber;
+  }
+
+  Future<List<PokemonCardResult>> _findTrustedSetNumberMatches({
+    required _ScannerSetClue trustedSetClue,
+    required String normalizedNumber,
+  }) async {
+    // ignore: avoid_print
+    print(
+      'SCAN DEBUG [direct-lock-query] setId="${trustedSetClue.setId}" '
+      'setName="${trustedSetClue.setName}" normalizedNumber="$normalizedNumber"',
+    );
+    await ensureSetPresent(trustedSetClue.setId);
+    final setCards = await fetchAllCardsForSet(trustedSetClue.setId);
+    final matches = setCards
+        .where(
+          (card) =>
+              _cardMatchesTrustedSetClue(card, trustedSetClue) &&
+              _cardMatchesTrustedCollectorNumber(card, normalizedNumber),
+        )
+        .toList();
+    // ignore: avoid_print
+    print(
+      'SCAN DEBUG [direct-lock-query] setCardCount=${setCards.length} '
+      'exactMatchCount=${matches.length}',
+    );
+    for (var i = 0; i < matches.length && i < 5; i++) {
+      final card = matches[i];
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [direct-lock-query] match${i + 1} '
+        'name="${card.name}" set="${card.setName}" setId="${card.setId}" '
+        'number="${card.number}" rarity="${card.rarity ?? ''}"',
+      );
+    }
+    return matches;
+  }
+
+  ({
+    int score,
+    bool strong,
+    bool compatible,
+    String reason,
+  }) _scannerNameConfidence({
+    required String ocrName,
+    required PokemonCardResult card,
+  }) {
+    final wantName = _normalizeScannerName(ocrName);
+    final gotName = _normalizeScannerName(card.name);
+    final wantCore = _scannerCoreSpeciesName(ocrName);
+    final gotCore = _scannerCoreSpeciesName(card.name);
+    final recoveredSpecies = _recoverSpeciesFromOcrName(ocrName);
+    final speciesSimilarity = _scannerSpeciesSimilarity(wantName, gotName);
+    final coreSimilarity = _scannerNormalizedLevenshteinSimilarity(
+      wantCore,
+      gotCore,
+    );
+    final exactName = wantName.isNotEmpty && wantName == gotName;
+    final exactCore = wantCore.isNotEmpty && wantCore == gotCore;
+    final sameRecoveredSpecies =
+        recoveredSpecies != null && gotCore == recoveredSpecies;
+    final sameMega = _scannerHasMarker(wantName, 'mega') ==
+        _scannerHasMarker(gotName, 'mega');
+    final sameEx =
+        _scannerHasMarker(wantName, 'ex') == _scannerHasMarker(gotName, 'ex');
+    final compatible = wantName.isEmpty ||
+        exactName ||
+        exactCore ||
+        sameRecoveredSpecies ||
+        _scannerNamesLookCompatible(wantName, gotName) ||
+        speciesSimilarity >= 0.55 ||
+        coreSimilarity >= 0.72;
+
+    var score = 0;
+    var reason = 'weak-name-confidence';
+
+    if (wantName.isEmpty) {
+      return (
+        score: 0,
+        strong: false,
+        compatible: true,
+        reason: 'empty-ocr-name',
+      );
+    }
+
+    if (exactName) {
+      score += 240;
+      reason = 'exact-name';
+    } else if (exactCore && sameMega && sameEx) {
+      score += 220;
+      reason = 'exact-species';
+    } else if (sameRecoveredSpecies && sameMega && sameEx) {
+      score += 210;
+      reason = 'recovered-species';
+    } else if (sameRecoveredSpecies) {
+      score += 175;
+      reason = 'recovered-species-marker-mismatch';
+    } else if (speciesSimilarity >= 0.88 && coreSimilarity >= 0.82) {
+      score += 185;
+      reason = 'very-high-species-similarity';
+    } else if (speciesSimilarity >= 0.78 && coreSimilarity >= 0.72) {
+      score += 145;
+      reason = 'high-species-similarity';
+    } else if (speciesSimilarity >= 0.64 && coreSimilarity >= 0.60) {
+      score += 95;
+      reason = 'medium-species-similarity';
+    }
+
+    if (!sameMega && _scannerHasMarker(wantName, 'mega')) {
+      score -= 25;
+    }
+    if (!sameEx && _scannerHasMarker(wantName, 'ex')) {
+      score -= 18;
+    }
+
+    if (!compatible) {
+      score -= 180;
+      reason = 'name-mismatch';
+    }
+
+    final strong = exactName ||
+        (exactCore && sameMega && sameEx) ||
+        (sameRecoveredSpecies && sameMega && sameEx) ||
+        (speciesSimilarity >= 0.78 && coreSimilarity >= 0.72);
+
+    return (
+      score: score,
+      strong: strong,
+      compatible: compatible,
+      reason: reason,
+    );
+  }
+
+  ({
+    PokemonCardResult? best,
+    List<PokemonCardResult> candidates,
+    bool accepted,
+    String reason,
+  }) _resolveTrustedSetNumberPick({
+    required List<PokemonCardResult> exactMatches,
+    required String ocrName,
+    required String? ocrNumber,
+    required String? numberSource,
+    required String? setCode,
+    required int? ocrPrintedTotal,
+    required int? ocrHp,
+  }) {
+    final evaluated =
+        exactMatches
+            .map(
+              (card) => (
+                card: card,
+                score: _scannerEvidenceScore(
+                  card: card,
+                  ocrName: ocrName,
+                  ocrNumber: ocrNumber,
+                  numberSource: numberSource,
+                  setCode: setCode,
+                  ocrPrintedTotal: ocrPrintedTotal,
+                  ocrHp: ocrHp,
+                ),
+                confidence: _scannerNameConfidence(ocrName: ocrName, card: card),
+              ),
+            )
+            .toList()
+          ..sort((a, b) {
+            final byScore = b.score.compareTo(a.score);
+            if (byScore != 0) return byScore;
+            final byNameScore =
+                b.confidence.score.compareTo(a.confidence.score);
+            if (byNameScore != 0) return byNameScore;
+            return a.card.id.compareTo(b.card.id);
+          });
+
+    final ordered = evaluated.map((row) => row.card).toList();
+    final top = evaluated.first;
+    final second = evaluated.length > 1 ? evaluated[1] : null;
+
+    if (!top.confidence.compatible) {
+      return (
+        best: null,
+        candidates: ordered,
+        accepted: false,
+        reason: 'name-mismatch',
+      );
+    }
+
+    if (!top.confidence.strong) {
+      return (
+        best: null,
+        candidates: ordered,
+        accepted: false,
+        reason: top.confidence.reason,
+      );
+    }
+
+    if (second == null) {
+      return (
+        best: top.card,
+        candidates: ordered,
+        accepted: true,
+        reason: 'single-exact-strong-name',
+      );
+    }
+
+    final lead = top.score - second.score;
+    final nameLead = top.confidence.score - second.confidence.score;
+    final sameNameVariantCount = evaluated
+        .where(
+          (row) =>
+              _normalizeScannerName(row.card.name) ==
+              _normalizeScannerName(top.card.name),
+        )
+        .length;
+
+    if (lead >= 55 && (nameLead >= 30 || !second.confidence.compatible)) {
+      return (
+        best: top.card,
+        candidates: ordered,
+        accepted: true,
+        reason: 'clear-top-variant lead=$lead nameLead=$nameLead',
+      );
+    }
+
+    if (sameNameVariantCount > 1) {
+      return (
+        best: null,
+        candidates: ordered,
+        accepted: false,
+        reason: 'variant-ambiguity same-name-count=$sameNameVariantCount',
+      );
+    }
+
+    return (
+      best: null,
+      candidates: ordered,
+      accepted: false,
+      reason: 'multiple-exact-matches lead=$lead nameLead=$nameLead',
+    );
+  }
+
   String _normalizeScannerName(String s) {
     final cleaned = _cleanName(s).toLowerCase().replaceAll('-', ' ');
     return cleaned.replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -344,6 +756,12 @@ class PokemonTcgApi {
     'ivysaur',
     'ninetales',
     'koffing',
+    'suicune',
+    'regigigas',
+    'marshadow',
+    'magneton',
+    'drakloak',
+    'guzzlord',
   ];
 
   String? _scannerDirectAliasRecovery(String rawName) {
@@ -802,6 +1220,7 @@ class PokemonTcgApi {
     required String ocrName,
     String? ocrNumber,
     String? numberSource,
+    String? setCode,
     int? ocrPrintedTotal,
     int? ocrHp,
   }) {
@@ -811,6 +1230,14 @@ class PokemonTcgApi {
     final cardNumUpper = card.number.toUpperCase();
     final trustedCollectorSource =
         _isTrustedCollectorSource(numberSource, ocrNumber);
+    final trustedSetClue = _resolveTrustedScannerSetClue(
+      setCode: setCode,
+      printedTotal: ocrPrintedTotal,
+    );
+    final explicitTrustedSetCode = _hasExplicitTrustedSetCode(setCode);
+    final matchesTrustedSet =
+        trustedSetClue != null && _cardMatchesTrustedSetClue(card, trustedSetClue);
+    final nameConfidence = _scannerNameConfidence(ocrName: ocrName, card: card);
 
     // ignore: avoid_print
     print(
@@ -822,16 +1249,56 @@ class PokemonTcgApi {
       'ocrNumber="${ocrNumber ?? ''}" numberSource="${numberSource ?? ''}"',
     );
 
+    if (trustedSetClue != null) {
+      if (matchesTrustedSet) {
+        score += trustedCollectorSource ? 320 : 120;
+      } else {
+        score -= trustedCollectorSource ? 220 : 65;
+      }
+
+      if (ocrPrintedTotal != null &&
+          trustedSetClue.printedTotal != null &&
+          ocrPrintedTotal == trustedSetClue.printedTotal &&
+          matchesTrustedSet) {
+        score += 55;
+      }
+
+      if (trustedCollectorSource &&
+          wantNumUpper.isNotEmpty &&
+          _cardMatchesTrustedCollectorNumber(card, wantNumUpper)) {
+        final allowsStrongTrustedNumberBonus =
+            matchesTrustedSet ||
+            (!explicitTrustedSetCode &&
+                ocrPrintedTotal != null &&
+                card.setPrintedTotal == ocrPrintedTotal);
+        score += allowsStrongTrustedNumberBonus ? 420 : -180;
+      }
+    }
+
     if (trustedCollectorSource) {
       if (wantNumUpper.isNotEmpty) {
+        final allowTrustedNumberBonus =
+            trustedSetClue == null ||
+            matchesTrustedSet ||
+            (!explicitTrustedSetCode &&
+                ocrPrintedTotal != null &&
+                card.setPrintedTotal == ocrPrintedTotal);
         if (cardNumUpper == wantNumUpper) {
-          score += 220;
+          if (!allowTrustedNumberBonus) {
+            score -= 40;
+          } else {
+            score += 220;
+          }
         } else {
           final cardBaseNum = cardNumUpper.contains('/')
               ? cardNumUpper.split('/').first
               : cardNumUpper;
           if (cardBaseNum == wantNumUpper) {
-            score += 180;
+            if (!allowTrustedNumberBonus) {
+              score -= 28;
+            } else {
+              score += 180;
+            }
           }
         }
       }
@@ -840,7 +1307,8 @@ class PokemonTcgApi {
           ocrPrintedTotal != null &&
           card.number.toUpperCase().contains('/') &&
           card.number.toUpperCase().split('/').first == wantNumUpper &&
-          card.setPrintedTotal == ocrPrintedTotal) {
+          card.setPrintedTotal == ocrPrintedTotal &&
+          (trustedSetClue == null || matchesTrustedSet || !explicitTrustedSetCode)) {
         score += 260;
       }
     } else {
@@ -922,11 +1390,20 @@ class PokemonTcgApi {
       }
     }
 
+    if (nameConfidence.strong) {
+      score += 55;
+    } else if (!nameConfidence.compatible) {
+      score -= 140;
+    }
+
     final wantNumDigits = _collectorDigits(ocrNumber);
     final gotNumDigits = _collectorDigits(card.number);
     if (wantNumDigits != null) {
       if (gotNumDigits == wantNumDigits) {
         score += 35;
+        if (trustedCollectorSource && matchesTrustedSet) {
+          score += 140;
+        }
       } else if (gotNumDigits != null &&
           (gotNumDigits - wantNumDigits).abs() <= 1) {
         score += 10;
@@ -1042,6 +1519,8 @@ class PokemonTcgApi {
     required String ocrName,
     String? ocrNumber,
     String? numberSource,
+    String? setCode,
+    String? setCodeSource,
     int? ocrPrintedTotal,
     int? ocrHp,
   }) {
@@ -1061,6 +1540,7 @@ class PokemonTcgApi {
                   ocrName: ocrName,
                   ocrNumber: ocrNumber,
                   numberSource: numberSource,
+                  setCode: setCode,
                   ocrPrintedTotal: ocrPrintedTotal,
                   ocrHp: ocrHp,
                 ),
@@ -1075,6 +1555,7 @@ class PokemonTcgApi {
       'SCAN DEBUG [$tag] candidates=${cards.length} '
       'ocrName="$ocrName" normalized="${_normalizeScannerName(ocrName)}" '
       'ocrNumber="${ocrNumber ?? ''}" ocrPrintedTotal=${ocrPrintedTotal ?? 'null'} '
+      'setCode="${setCode ?? ''}" setCodeSource="${setCodeSource ?? ''}" '
       'ocrHp=${ocrHp ?? 'null'}',
     );
     for (var i = 0; i < top.length; i++) {
@@ -1084,7 +1565,7 @@ class PokemonTcgApi {
         'SCAN DEBUG [$tag] top${i + 1} score=${row.score} '
         'name="${row.card.name}" number="${row.card.number}" '
         'set="${row.card.setName}" setId="${row.card.setId}" '
-        'hp=${row.card.hp ?? 'null'}',
+        'rarity="${row.card.rarity ?? ''}" hp=${row.card.hp ?? 'null'}',
       );
     }
   }
@@ -1094,14 +1575,36 @@ class PokemonTcgApi {
     required String ocrName,
     String? ocrNumber,
     String? numberSource,
+    String? setCode,
     int? ocrPrintedTotal,
     int? ocrHp,
   }) {
+    final trustedSetClue = _resolveTrustedScannerSetClue(
+      setCode: setCode,
+      printedTotal: ocrPrintedTotal,
+    );
+    if (trustedSetClue != null &&
+        !_cardMatchesTrustedSetClue(card, trustedSetClue)) {
+      return false;
+    }
+
+    final trustedCollectorNumber =
+        _hasTrustedCollectorNumber(numberSource, ocrNumber);
+    final exactTrustedNumber = trustedCollectorNumber &&
+        ocrNumber != null &&
+        ocrNumber.isNotEmpty &&
+        _cardMatchesTrustedCollectorNumber(card, ocrNumber);
+    final nameConfidence = _scannerNameConfidence(ocrName: ocrName, card: card);
+    if (trustedSetClue != null && exactTrustedNumber && !nameConfidence.strong) {
+      return false;
+    }
+
     final score = _scannerEvidenceScore(
       card: card,
       ocrName: ocrName,
       ocrNumber: ocrNumber,
       numberSource: numberSource,
+      setCode: setCode,
       ocrPrintedTotal: ocrPrintedTotal,
       ocrHp: ocrHp,
     );
@@ -1142,6 +1645,7 @@ class PokemonTcgApi {
     required String ocrName,
     String? ocrNumber,
     String? numberSource,
+    String? setCode,
     int? ocrPrintedTotal,
     int? ocrHp,
   }) {
@@ -1157,6 +1661,7 @@ class PokemonTcgApi {
                   ocrName: ocrName,
                   ocrNumber: ocrNumber,
                   numberSource: numberSource,
+                  setCode: setCode,
                   ocrPrintedTotal: ocrPrintedTotal,
                   ocrHp: ocrHp,
                 ),
@@ -2165,6 +2670,8 @@ class PokemonTcgApi {
     required String name,
     String? number,
     String? numberSource,
+    String? setCode,
+    String? setCodeSource,
     String? imagePath,
     String? setTotal,
     int? hp,
@@ -2179,6 +2686,13 @@ class PokemonTcgApi {
     final lowerName = safeName.toLowerCase().trim();
     final wantNum = _cleanCollectorNumber(number);
     final wantTotal = _parseSetTotal(setTotal);
+    final trustedSetClue = _resolveTrustedScannerSetClue(
+      setCode: setCode,
+      printedTotal: wantTotal,
+    );
+    final trustedCollectorNumber =
+        _hasTrustedCollectorNumber(numberSource, wantNum);
+    final hasExplicitTrustedSetCode = _hasExplicitTrustedSetCode(setCode);
     final useScannerConfidence = hp != null;
     final weakNumber = wantNum == null || wantNum.isEmpty;
     final recoveredSpecies = _recoverSpeciesFromOcrName(name);
@@ -2194,10 +2708,120 @@ class PokemonTcgApi {
       'SCAN DEBUG [entry] rawName="$name" safeName="$safeName" '
       'normalized="${_normalizeScannerName(safeName)}" '
       'number="${wantNum ?? ''}" setTotal=${wantTotal ?? 'null'} '
+      'setCode="${setCode ?? ''}" setCodeSource="${setCodeSource ?? ''}" '
       'numberSource="${numberSource ?? ''}" '
       'hp=${hp ?? 'null'} expectedSetId="${expectedSetId ?? ''}" '
       'expectedSlot=${expectedSlot ?? 'null'} svpSlot=${svpSlot ?? 'null'}',
     );
+    // ignore: avoid_print
+    print(
+      'SCAN DEBUG [entry-normalized] cleanedNumber="${wantNum ?? ''}" '
+      'trustedCollectorNumber=$trustedCollectorNumber '
+      'hasExplicitTrustedSetCode=$hasExplicitTrustedSetCode '
+      'recoveredSpecies="${recoveredSpecies ?? ''}" '
+      'weakNumber=$weakNumber useScannerConfidence=$useScannerConfidence',
+    );
+    if (trustedSetClue != null) {
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [set-clue] code="${trustedSetClue.code}" setId="${trustedSetClue.setId}" '
+        'setName="${trustedSetClue.setName}" printedTotal=${trustedSetClue.printedTotal ?? 'null'}',
+      );
+    } else {
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [set-clue] code="${setCode ?? ''}" printedTotal=${wantTotal ?? 'null'} resolved="none"',
+      );
+    }
+
+    final shouldAttemptDirectLock =
+        trustedSetClue != null &&
+        trustedCollectorNumber &&
+        wantNum != null &&
+        wantNum.isNotEmpty;
+    // ignore: avoid_print
+    print(
+      'SCAN DEBUG [direct-lock-gate] shouldAttempt=$shouldAttemptDirectLock '
+      'hasTrustedSetClue=${trustedSetClue != null} '
+      'trustedCollectorNumber=$trustedCollectorNumber '
+      'wantNum="${wantNum ?? ''}" hasExplicitTrustedSetCode=$hasExplicitTrustedSetCode',
+    );
+
+    if (shouldAttemptDirectLock) {
+      final directLockClue = trustedSetClue!;
+      final directLockNumber = wantNum!;
+      try {
+        final exactMatches = await _findTrustedSetNumberMatches(
+          trustedSetClue: directLockClue,
+          normalizedNumber: directLockNumber,
+        );
+        if (exactMatches.isNotEmpty) {
+          final exactPick = _resolveTrustedSetNumberPick(
+            exactMatches: exactMatches,
+            ocrName: safeName,
+            ocrNumber: directLockNumber,
+            numberSource: numberSource,
+            setCode: setCode,
+            ocrPrintedTotal: wantTotal,
+            ocrHp: hp,
+          );
+          final canHardLock =
+              hasExplicitTrustedSetCode || exactMatches.length == 1;
+          if (exactPick.accepted && exactPick.best != null && canHardLock) {
+            final locked = exactPick.best!;
+            // ignore: avoid_print
+            print(
+              'SCAN LOCK accepted reason="${exactPick.reason}" '
+              'setCode="${setCode ?? ''}" setId="${directLockClue.setId}" '
+              'number="$directLockNumber" resultName="${locked.name}" '
+              'resultSet="${locked.setName}" resultNumber="${locked.number}" '
+              'matchCount=${exactPick.candidates.length}',
+            );
+            return ReliablePick(
+              best: locked,
+              candidates: exactPick.candidates,
+              strategy: hasExplicitTrustedSetCode
+                  ? 'trusted-set-number-lock'
+                  : 'trusted-total-number-lock',
+            );
+          }
+
+          // ignore: avoid_print
+          print(
+            'SCAN LOCK rejected reason="${exactPick.accepted && !canHardLock ? 'printed-total-variant-ambiguity' : exactPick.reason}" '
+            'setCode="${setCode ?? ''}" setId="${directLockClue.setId}" '
+            'number="$directLockNumber" matchCount=${exactPick.candidates.length}',
+          );
+          return ReliablePick(
+            best: null,
+            candidates: exactPick.candidates,
+            strategy: hasExplicitTrustedSetCode
+                ? 'trusted-set-number-candidates'
+                : 'trusted-total-number-candidates',
+          );
+        }
+        // ignore: avoid_print
+        print(
+          'SCAN LOCK rejected reason="no-exact-set-number-match" '
+          'setCode="${setCode ?? ''}" setId="${directLockClue.setId}" '
+          'number="$directLockNumber" matchCount=0',
+        );
+      } catch (e) {
+        // ignore: avoid_print
+        print('trusted set exact lock failed: $e');
+      }
+    } else {
+      final reasons = <String>[
+        if (trustedSetClue == null) 'missing-trusted-set-clue',
+        if (!trustedCollectorNumber) 'untrusted-or-missing-number',
+        if (wantNum == null || wantNum.isEmpty) 'empty-normalized-number',
+      ];
+      // ignore: avoid_print
+      print(
+        'SCAN LOCK rejected reason="${reasons.join(',')}" '
+        'setCode="${setCode ?? ''}" number="${wantNum ?? ''}"',
+      );
+    }
     if (recoveredQueryNames.isNotEmpty) {
       // ignore: avoid_print
       print(
@@ -2365,6 +2989,7 @@ class PokemonTcgApi {
                 ocrName: safeName,
                 ocrNumber: wantNum,
                 numberSource: numberSource,
+                setCode: setCode,
                 ocrPrintedTotal: wantTotal,
                 ocrHp: hp,
               )) {
@@ -2382,6 +3007,8 @@ class PokemonTcgApi {
               ocrName: safeName,
               ocrNumber: wantNum,
               numberSource: numberSource,
+              setCode: setCode,
+              setCodeSource: setCodeSource,
               ocrPrintedTotal: wantTotal,
               ocrHp: hp,
             );
@@ -2390,6 +3017,7 @@ class PokemonTcgApi {
               ocrName: safeName,
               ocrNumber: wantNum,
               numberSource: numberSource,
+              setCode: setCode,
               ocrPrintedTotal: wantTotal,
               ocrHp: hp,
             );
@@ -2412,6 +3040,8 @@ class PokemonTcgApi {
             ocrName: safeName,
             ocrNumber: wantNum,
             numberSource: numberSource,
+            setCode: setCode,
+            setCodeSource: setCodeSource,
             ocrPrintedTotal: wantTotal,
             ocrHp: hp,
           );
@@ -2421,6 +3051,7 @@ class PokemonTcgApi {
                   ocrName: safeName,
                   ocrNumber: wantNum,
                   numberSource: numberSource,
+                  setCode: setCode,
                   ocrPrintedTotal: wantTotal,
                   ocrHp: hp,
                 )
@@ -2524,6 +3155,45 @@ class PokemonTcgApi {
 
     if (deferredWorkerPick != null) {
       addFallbacks(deferredWorkerPick!.candidates);
+    }
+
+    if (trustedSetClue != null && safeName.isNotEmpty) {
+      try {
+        final focusedBrowse = await _tryWorkerBrowseSearch(
+          name: safeName,
+          set: trustedSetClue.setName,
+          pageSize: 20,
+        );
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [fallback-set-browse] count=${focusedBrowse.length} '
+          'name="$safeName" set="${trustedSetClue.setName}"',
+        );
+        addFallbacks(focusedBrowse);
+      } catch (e) {
+        // ignore: avoid_print
+        print('trusted set browse fallback failed: $e');
+      }
+
+      try {
+        final focusedDirect = await _refreshSearchDirect(
+          name: safeName,
+          set: trustedSetClue.setName,
+          number: wantNum,
+          setTotal: setTotal,
+          pageSize: 20,
+        );
+        // ignore: avoid_print
+        print(
+          'SCAN DEBUG [fallback-set-direct] count=${focusedDirect.length} '
+          'name="$safeName" set="${trustedSetClue.setName}" '
+          'number="${wantNum ?? ''}" setTotal=${wantTotal ?? 'null'}',
+        );
+        addFallbacks(focusedDirect);
+      } catch (e) {
+        // ignore: avoid_print
+        print('trusted set direct fallback failed: $e');
+      }
     }
 
     if (recoveredQueryNames.isNotEmpty && weakNumber) {
@@ -2682,6 +3352,8 @@ class PokemonTcgApi {
         ocrName: safeName,
         ocrNumber: wantNum,
         numberSource: numberSource,
+        setCode: setCode,
+        setCodeSource: setCodeSource,
         ocrPrintedTotal: wantTotal,
         ocrHp: hp,
       );
@@ -2695,6 +3367,7 @@ class PokemonTcgApi {
                     ocrName: safeName,
                     ocrNumber: wantNum,
                     numberSource: numberSource,
+                    setCode: setCode,
                     ocrPrintedTotal: wantTotal,
                     ocrHp: hp,
                   ),
@@ -2828,6 +3501,7 @@ class PokemonTcgApi {
         ocrName: safeName,
         ocrNumber: wantNum,
         numberSource: numberSource,
+        setCode: setCode,
         ocrPrintedTotal: wantTotal,
         ocrHp: hp,
       );

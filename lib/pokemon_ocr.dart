@@ -9,6 +9,8 @@ class OcrGuess {
   final String? number; // numerator only, e.g. "65"
   final String? setTotal; // denominator, e.g. "202"
   final String? numberSource; // "main", "bottom_left", "bottom_broad"
+  final String? setCode; // e.g. "ASC"
+  final String? setCodeSource; // e.g. "raw_token", "line_token"
   final int? hp;
   final String? stage; // "Basic", "Stage 1", "Stage 2"
   final String rawText;
@@ -23,6 +25,8 @@ class OcrGuess {
     required this.number,
     required this.setTotal,
     this.numberSource,
+    this.setCode,
+    this.setCodeSource,
     required this.hp,
     required this.stage,
     required this.rawText,
@@ -34,6 +38,22 @@ class OcrGuess {
 
 class PokemonOcr {
   static const bool debug = false;
+  static const Map<String, String> _trustedSetCodeAliases = <String, String>{
+    'ASC': 'Ascended Heroes',
+    'MEG': 'Mega Evolution',
+    'PRE': 'Prismatic Evolutions',
+    'SVI': 'Scarlet & Violet',
+    'PAL': 'Paldea Evolved',
+    'OBF': 'Obsidian Flames',
+    'MEW': '151',
+    'PAR': 'Paradox Rift',
+    'TEF': 'Temporal Forces',
+    'TWM': 'Twilight Masquerade',
+    'SCR': 'Stellar Crown',
+    'SSP': 'Surging Sparks',
+    'DRI': 'Destined Rivals',
+    'SVP': 'Scarlet & Violet Black Star Promos',
+  };
 
   static final _stopWords = <String>{
     'basic',
@@ -292,6 +312,90 @@ class PokemonOcr {
     return n == null ? s.trim() : n.toString();
   }
 
+  static String _normalizeCollectorFractionSide(
+    String raw, {
+    required bool isTotal,
+  }) {
+    var t = _deaccent(raw).toUpperCase().replaceAll(RegExp(r'\s+'), '');
+    t = t
+        .replaceAll('O', '0')
+        .replaceAll('S', '5')
+        .replaceAll('I', '1')
+        .replaceAll('L', '1')
+        .replaceAll('|', '1')
+        .replaceAll('B', '8')
+        .replaceAll('Z', '2');
+    t = t.replaceAll(RegExp(r'[^0-9]'), '');
+
+    if (isTotal && t.length >= 4 && t.endsWith('0')) {
+      final trimmed = t.substring(0, t.length - 1);
+      final trimmedInt = int.tryParse(trimmed);
+      if (trimmedInt != null && trimmedInt >= 40 && trimmedInt <= 400) {
+        t = trimmed;
+      }
+    }
+
+    return t;
+  }
+
+  static ({
+    String rawToken,
+    String normalizedToken,
+    String? number,
+    String? setTotal,
+  })? _parseCollectorFractionToken(
+    String rawToken, {
+    required String source,
+  }) {
+    final compact = _deaccent(rawToken).replaceAll(RegExp(r'\s+'), '');
+    final m = RegExp(
+      r'([0-9OSILBZ]{1,5})\s*([/|Il\-\u2013\u2014])\s*([0-9OSILBZ]{2,5})',
+      caseSensitive: false,
+    ).firstMatch(compact);
+
+    if (m == null) {
+      return null;
+    }
+
+    final leftRaw = m.group(1) ?? '';
+    final rightRaw = m.group(3) ?? '';
+    final leftNorm = _normalizeCollectorFractionSide(
+      leftRaw,
+      isTotal: false,
+    );
+    final rightNorm = _normalizeCollectorFractionSide(
+      rightRaw,
+      isTotal: true,
+    );
+    final normalizedToken = '$leftNorm/$rightNorm';
+    final numInt = int.tryParse(leftNorm);
+    final denInt = int.tryParse(rightNorm);
+    final accepted =
+        numInt != null &&
+        denInt != null &&
+        denInt >= 40 &&
+        denInt <= 400 &&
+        numInt >= 1 &&
+        numInt <= denInt + 300;
+
+    // ignore: avoid_print
+    print(
+      'SCAN DEBUG [ocr-fraction-candidate] raw="$rawToken" '
+      'normalized="$normalizedToken" parsedNumber="${numInt?.toString() ?? ''}" '
+      'parsedTotal="${denInt?.toString() ?? ''}" source="$source" '
+      'accepted=$accepted',
+    );
+
+    if (!accepted) return null;
+
+    return (
+      rawToken: rawToken,
+      normalizedToken: normalizedToken,
+      number: leftNorm,
+      setTotal: rightNorm,
+    );
+  }
+
   // ---------- SVP promo extraction ----------
   static String? extractSvpNumberStringFromRaw(String rawText) {
     final t = _normalizeDigitsForNumbers(rawText);
@@ -334,10 +438,9 @@ class PokemonOcr {
     List<_LineBox> lineBoxes,
     String raw,
   ) {
-    // We only accept fraction-like separators (/, |, I, l, -, en-dash/em-dash)
-    // This avoids inventing pairs like "150 130" from random text.
     final frac = RegExp(
-      r'([0-9]{1,4})\s*([/|Il\-\u2013\u2014])\s*([0-9]{2,4})',
+      r'([0-9OSILBZ]{1,5}\s*[/|Il\-\u2013\u2014]\s*[0-9OSILBZ]{2,5})',
+      caseSensitive: false,
     );
 
     final candidates = <_NumCandidate>[];
@@ -353,28 +456,34 @@ class PokemonOcr {
           sLower.contains('evolves from');
     }
 
-    void addMatches(String text, int lineIndex, double top, double left) {
-      final t = _normalizeDigitsForNumbers(text);
-      final lower = t.toLowerCase();
+    void addMatches(
+      String text,
+      int lineIndex,
+      double top,
+      double left, {
+      required String source,
+    }) {
+      final normalizedText = _normalizeDigitsForNumbers(text);
+      final lower = normalizedText.toLowerCase();
+      final localSeen = <String>{};
 
       // skip obvious non-number lines
       if (looksLikeDamageLine(lower)) return;
 
-      for (final m in frac.allMatches(t)) {
-        final num = m.group(1);
-        final den = m.group(3);
-        if (num == null || den == null) continue;
+      for (final m in frac.allMatches(_deaccent(text))) {
+        final rawCandidate = m.group(1);
+        if (rawCandidate == null || rawCandidate.isEmpty) continue;
+        final parsed = _parseCollectorFractionToken(
+          rawCandidate,
+          source: source,
+        );
+        if (parsed == null) continue;
+        final key = '${parsed.number}/${parsed.setTotal}';
+        if (!localSeen.add(key)) continue;
 
-        final numInt = int.tryParse(num);
-        final denInt = int.tryParse(den);
+        final numInt = int.tryParse(parsed.number!);
+        final denInt = int.tryParse(parsed.setTotal!);
         if (numInt == null || denInt == null) continue;
-
-        // plausibility: modern printed totals typically 60..400, keep it tight
-        if (denInt < 40 || denInt > 400) continue;
-
-        // numerator plausibility:
-        // allow secret rares > printedTotal (e.g. 245/198), but not insane
-        if (numInt < 1 || numInt > denInt + 300) continue;
 
         candidates.add(
           _NumCandidate(
@@ -390,12 +499,18 @@ class PokemonOcr {
 
     // 1) scan all lines
     for (var i = 0; i < lineBoxes.length; i++) {
-      addMatches(lineBoxes[i].text, i, lineBoxes[i].top, lineBoxes[i].left);
+      addMatches(
+        lineBoxes[i].text,
+        i,
+        lineBoxes[i].top,
+        lineBoxes[i].left,
+        source: 'main_line',
+      );
     }
 
     // 2) raw fallback
     if (candidates.isEmpty) {
-      addMatches(raw, 999, 0, 0);
+      addMatches(raw, 999, 0, 0, source: 'raw_fallback');
     }
 
     // 3) bottom-right bias pass (helps when OCR scatters the number)
@@ -412,6 +527,7 @@ class PokemonOcr {
           900 + i,
           bottomRight[i].top,
           bottomRight[i].left,
+          source: 'bottom_right_bias',
         );
         if (candidates.isNotEmpty) break;
       }
@@ -755,6 +871,48 @@ class PokemonOcr {
     return lineBoxes.map((lb) => lb.text.trim()).where((s) => s.isNotEmpty).join('\n');
   }
 
+  static String _normalizeSetCodeToken(String raw) {
+    return raw
+        .toUpperCase()
+        .replaceAll('5', 'S')
+        .replaceAll('0', 'O')
+        .replaceAll('1', 'I')
+        .replaceAll(RegExp(r'[^A-Z0-9]'), '');
+  }
+
+  static ({String? code, String? source}) _extractTrustedSetCode({
+    required String raw,
+    required List<_LineBox> lineBoxes,
+  }) {
+    final tokenPattern = RegExp(r'\b[A-Z0-9]{2,6}\b');
+    final sources = <({String source, Iterable<String> tokens})>[
+      (
+        source: 'raw_token',
+        tokens: tokenPattern
+            .allMatches(raw.toUpperCase())
+            .map((m) => m.group(0) ?? ''),
+      ),
+      for (final lb in lineBoxes)
+        (
+          source: 'line_token',
+          tokens: tokenPattern
+              .allMatches(lb.text.toUpperCase())
+              .map((m) => m.group(0) ?? ''),
+        ),
+    ];
+
+    for (final source in sources) {
+      for (final token in source.tokens) {
+        final normalized = _normalizeSetCodeToken(token);
+        if (_trustedSetCodeAliases.containsKey(normalized)) {
+          return (code: normalized, source: source.source);
+        }
+      }
+    }
+
+    return (code: null, source: null);
+  }
+
   static Future<String?> _writeTopTitleCrop(String path) async {
     try {
       final bytes = await File(path).readAsBytes();
@@ -899,25 +1057,31 @@ class PokemonOcr {
       ];
 
       final fractionPattern = RegExp(
-        r'\b([A-Z]{0,5}\s*[0-9O]{1,4})\s*[/|]\s*([A-Z]{0,5}\s*[0-9O]{2,4})\b',
+        r'([0-9OSILBZ]{1,5}\s*[/|Il\-\u2013\u2014]\s*[0-9OSILBZ]{2,5})',
+        caseSensitive: false,
       );
       final promoPattern = RegExp(
         r'\b((?:SVP|SWSH)\s*[0-9O]{1,3})\b',
       );
       print('OCR BOTTOM RAW >>> ${pass.raw.replaceAll('\n', ' | ')}');
 
-      for (final source in sources) {
+      for (var i = 0; i < sources.length; i++) {
+        final source = sources[i];
         final normalized = _normalizeBottomCollectorText(source);
         if (normalized.isEmpty) continue;
         final compact = normalized.replaceAll(' ', '');
+        final sourceTag = i == 0 ? 'bottom_raw' : 'bottom_line';
 
-        for (final candidate in [normalized, compact]) {
-          final fractionMatch = fractionPattern.firstMatch(candidate);
-          if (fractionMatch != null) {
-            final left = _cleanBottomCollectorToken(fractionMatch.group(1)!);
-            final right = _cleanBottomCollectorToken(fractionMatch.group(2)!);
-            if (left.isNotEmpty && right.isNotEmpty) {
-              return {'number': left, 'setTotal': right};
+        for (final candidate in [source, normalized, compact]) {
+          for (final fractionMatch in fractionPattern.allMatches(candidate)) {
+            final rawCandidate = fractionMatch.group(1);
+            if (rawCandidate == null || rawCandidate.isEmpty) continue;
+            final parsed = _parseCollectorFractionToken(
+              rawCandidate,
+              source: sourceTag,
+            );
+            if (parsed != null) {
+              return {'number': parsed.number, 'setTotal': parsed.setTotal};
             }
           }
         }
@@ -959,25 +1123,31 @@ class PokemonOcr {
       ];
 
       final fractionPattern = RegExp(
-        r'\b([A-Z]{0,5}\s*[0-9O]{1,4})\s*[/|]\s*([A-Z]{0,5}\s*[0-9O]{2,4})\b',
+        r'([0-9OSILBZ]{1,5}\s*[/|Il\-\u2013\u2014]\s*[0-9OSILBZ]{2,5})',
+        caseSensitive: false,
       );
       final promoPattern = RegExp(
         r'\b((?:SVP|SWSH)\s*[0-9O]{1,3})\b',
       );
       print('OCR BOTTOM LEFT RAW >>> ${pass.raw.replaceAll('\n', ' | ')}');
 
-      for (final source in sources) {
+      for (var i = 0; i < sources.length; i++) {
+        final source = sources[i];
         final normalized = _normalizeBottomCollectorText(source);
         if (normalized.isEmpty) continue;
         final compact = normalized.replaceAll(' ', '');
+        final sourceTag = i == 0 ? 'bottom_left_raw' : 'bottom_left_line';
 
-        for (final candidate in [normalized, compact]) {
-          final fractionMatch = fractionPattern.firstMatch(candidate);
-          if (fractionMatch != null) {
-            final left = _cleanBottomCollectorToken(fractionMatch.group(1)!);
-            final right = _cleanBottomCollectorToken(fractionMatch.group(2)!);
-            if (left.isNotEmpty && right.isNotEmpty) {
-              return {'number': left, 'setTotal': right};
+        for (final candidate in [source, normalized, compact]) {
+          for (final fractionMatch in fractionPattern.allMatches(candidate)) {
+            final rawCandidate = fractionMatch.group(1);
+            if (rawCandidate == null || rawCandidate.isEmpty) continue;
+            final parsed = _parseCollectorFractionToken(
+              rawCandidate,
+              source: sourceTag,
+            );
+            if (parsed != null) {
+              return {'number': parsed.number, 'setTotal': parsed.setTotal};
             }
           }
         }
@@ -1237,6 +1407,7 @@ class PokemonOcr {
       }
       final hp = _extractHp(raw);
       final stage = _extractStage(raw);
+      final setCode = _extractTrustedSetCode(raw: raw, lineBoxes: lineBoxes);
       print('🧾 FRACTION DEBUG → ${frac.number}/${frac.setTotal}');
 
       if (bottomLeftFrac['number'] != null || bottomLeftFrac['setTotal'] != null) {
@@ -1252,6 +1423,21 @@ class PokemonOcr {
       print(
         'OCR FRACTION RESOLVED >>> number=$resolvedNumber total=$resolvedSetTotal source=$fractionSource',
       );
+      print(
+        'SCAN DEBUG [ocr-extract] mainFraction="${frac.number ?? ''}/${frac.setTotal ?? ''}" '
+        'bottomLeft="${bottomLeftFrac['number'] ?? ''}/${bottomLeftFrac['setTotal'] ?? ''}" '
+        'bottomBroad="${bottomFrac['number'] ?? ''}/${bottomFrac['setTotal'] ?? ''}" '
+        'resolvedNumber="${resolvedNumber ?? ''}" resolvedTotal="${resolvedSetTotal ?? ''}" '
+        'fractionSource="$fractionSource" setCode="${setCode.code ?? ''}" '
+        'setCodeSource="${setCode.source ?? ''}"',
+      );
+      if (setCode.code != null) {
+        print(
+          'OCR SET CODE >>> code=${setCode.code} source=${setCode.source} alias=${_trustedSetCodeAliases[setCode.code]!}',
+        );
+      } else {
+        print('OCR SET CODE >>> code= source= alias=');
+      }
       print('OCR TOP CROP RAW >>> $topTitleRaw');
       print('OCR TOP CROP LINES >>> ${topPassPreview.join(' | ')}');
       final topStripName = topTitleRaw.isEmpty
@@ -1335,12 +1521,20 @@ class PokemonOcr {
       print(
         '🔍 OCR DEBUG → name=$best, number=${frac.number}, setTotal=${frac.setTotal}, hp=$hp, stage=$stage',
       );
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [ocr-set-clue] name="$best" number="${resolvedNumber ?? ''}" '
+        'setTotal="${resolvedSetTotal ?? ''}" setCode="${setCode.code ?? ''}" '
+        'setCodeSource="${setCode.source ?? ''}"',
+      );
 
       return OcrGuess(
         name: best,
         number: resolvedNumber,
         setTotal: resolvedSetTotal,
         numberSource: fractionSource,
+        setCode: setCode.code,
+        setCodeSource: setCode.source,
         hp: hp,
         stage: stage,
         rawText: raw,

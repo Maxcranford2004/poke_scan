@@ -477,20 +477,12 @@ class CollectionStore extends ChangeNotifier {
 
     await _saveProfile();
     _bumpProfileViewVersion();
-    lastAchievementEvent.value = AchievementEvent(
-      id: newlyUnlocked.first,
-      title: _achievementTitle(newlyUnlocked.first),
-    );
 
-    for (var i = 1; i < newlyUnlocked.length; i++) {
-      final id = newlyUnlocked[i];
-      unawaited(
-        Future<void>.delayed(Duration(milliseconds: 2200 * i), () {
-          lastAchievementEvent.value = AchievementEvent(
-            id: id,
-            title: _achievementTitle(id),
-          );
-        }),
+    // Emit each unlock immediately and let the UI queue decide playback timing.
+    for (final id in newlyUnlocked) {
+      lastAchievementEvent.value = AchievementEvent(
+        id: id,
+        title: _achievementTitle(id),
       );
     }
   }
