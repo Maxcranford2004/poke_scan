@@ -1573,6 +1573,7 @@ class PokemonTcgApi {
   bool _acceptScannerWorkerBest({
     required PokemonCardResult card,
     required String ocrName,
+    String? recoveredSpecies,
     String? ocrNumber,
     String? numberSource,
     String? setCode,
@@ -1583,17 +1584,53 @@ class PokemonTcgApi {
       setCode: setCode,
       printedTotal: ocrPrintedTotal,
     );
+    final trustedNumber = _cleanCollectorNumber(ocrNumber);
+    final trustedCollectorNumber =
+        _hasTrustedCollectorNumber(numberSource, ocrNumber);
     if (trustedSetClue != null &&
         !_cardMatchesTrustedSetClue(card, trustedSetClue)) {
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [worker-best-rejected] reason="trusted-set-mismatch" '
+        'recoveredSpecies="${recoveredSpecies ?? ''}" '
+        'trustedNumber="${trustedNumber ?? ''}" '
+        'trustedSetId="${trustedSetClue.setId}" '
+        'trustedSetName="${trustedSetClue.setName}" '
+        'workerBest="${card.name}" workerBestSet="${card.setName}" '
+        'workerBestNumber="${card.number}"',
+      );
       return false;
     }
 
-    final trustedCollectorNumber =
-        _hasTrustedCollectorNumber(numberSource, ocrNumber);
+    final candidateCore = _scannerCoreSpeciesName(card.name);
+    if (recoveredSpecies != null &&
+        recoveredSpecies.isNotEmpty &&
+        candidateCore != recoveredSpecies) {
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [worker-best-rejected] reason="species-mismatch" '
+        'recoveredSpecies="$recoveredSpecies" workerBest="${card.name}"',
+      );
+      return false;
+    }
+
     final exactTrustedNumber = trustedCollectorNumber &&
-        ocrNumber != null &&
-        ocrNumber.isNotEmpty &&
-        _cardMatchesTrustedCollectorNumber(card, ocrNumber);
+        trustedNumber != null &&
+        trustedNumber.isNotEmpty &&
+        _cardMatchesTrustedCollectorNumber(card, trustedNumber);
+    if (trustedCollectorNumber && !exactTrustedNumber) {
+      // ignore: avoid_print
+      print(
+        'SCAN DEBUG [worker-best-rejected] reason="trusted-number-mismatch" '
+        'recoveredSpecies="${recoveredSpecies ?? ''}" '
+        'trustedNumber="${trustedNumber ?? ''}" '
+        'trustedSetId="${trustedSetClue?.setId ?? ''}" '
+        'trustedSetName="${trustedSetClue?.setName ?? ''}" '
+        'workerBest="${card.name}" workerBestSet="${card.setName}" '
+        'workerBestNumber="${card.number}"',
+      );
+      return false;
+    }
     final nameConfidence = _scannerNameConfidence(ocrName: ocrName, card: card);
     if (trustedSetClue != null && exactTrustedNumber && !nameConfidence.strong) {
       return false;
@@ -2987,6 +3024,7 @@ class PokemonTcgApi {
               _acceptScannerWorkerBest(
                 card: best,
                 ocrName: safeName,
+                recoveredSpecies: recoveredSpecies,
                 ocrNumber: wantNum,
                 numberSource: numberSource,
                 setCode: setCode,

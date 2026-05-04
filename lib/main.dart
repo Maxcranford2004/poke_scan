@@ -3106,8 +3106,12 @@ class _PostScanExitRegistrationAnimationScreenState
     final explicit = widget.returnTarget.slot;
     if (explicit != null && explicit > 0) return explicit;
 
-    final digits = widget.card.number.replaceAll(RegExp(r'[^0-9]'), '');
-    final parsed = int.tryParse(digits);
+    final rawNumber = widget.card.number.trim().toUpperCase();
+    final numerator = rawNumber.contains('/')
+        ? rawNumber.split('/').first.trim()
+        : rawNumber;
+    final match = RegExp(r'(\d{1,4})').firstMatch(numerator);
+    final parsed = match == null ? null : int.tryParse(match.group(1)!);
     if (parsed != null && parsed > 0) return parsed;
     return 1;
   }
@@ -3118,10 +3122,11 @@ class _PostScanExitRegistrationAnimationScreenState
     Map<int, PreviewCard> previewMap,
     Map<int, PokemonCardResult> ownedMap,
   ) {
-    final printedTotal = widget.card.setPrintedTotal;
-    if (printedTotal != null && printedTotal > 0) return printedTotal;
-
     var maxSlot = _targetSlot;
+    final printedTotal = widget.card.setPrintedTotal;
+    if (printedTotal != null && printedTotal > maxSlot) {
+      maxSlot = printedTotal;
+    }
     for (final slot in previewMap.keys) {
       if (slot > maxSlot) maxSlot = slot;
     }
@@ -3137,8 +3142,12 @@ class _PostScanExitRegistrationAnimationScreenState
         : _visibleSlotCount;
     if (totalVisible <= 0) return <int>[_targetSlot];
 
-    var start = _targetSlot - (totalVisible ~/ 2);
-    if (start < 1) start = 1;
+    final visibleRows = (totalVisible / _gridColumns).ceil();
+    final targetRow = (_targetSlot - 1) ~/ _gridColumns;
+    var startRow = targetRow - (visibleRows ~/ 2);
+    if (startRow < 0) startRow = 0;
+
+    var start = (startRow * _gridColumns) + 1;
     final maxStart = (totalSlots - totalVisible + 1)
         .clamp(1, totalSlots)
         .toInt();
@@ -3300,6 +3309,11 @@ class _PostScanExitRegistrationAnimationScreenState
         : const <int, PreviewCard>{};
     final totalSlots = _deriveTotalSlots(previewMap, ownedMap);
     final visibleSlots = _visibleSlotsForTotal(totalSlots);
+    final targetPreview = previewMap[_targetSlot];
+    final targetPreviewUrl =
+        (targetPreview?.imageSmall.isNotEmpty ?? false)
+        ? targetPreview!.imageSmall
+        : (targetPreview?.imageLarge ?? '');
     final targetIndex = visibleSlots
         .indexOf(_targetSlot)
         .clamp(0, visibleSlots.length - 1)
@@ -3308,6 +3322,19 @@ class _PostScanExitRegistrationAnimationScreenState
         ? (_setKey.isEmpty ? 'Collection Set' : _setKey.toUpperCase())
         : widget.card.setName;
     final ownedCount = ownedMap.length;
+
+    // ignore: avoid_print
+    print(
+      'EXIT ANIM target setId="${widget.card.setId}" '
+      'setName="$setName" cardNumber="${widget.card.number}" '
+      'targetSlot=$_targetSlot',
+    );
+    // ignore: avoid_print
+    print('EXIT ANIM visibleSlots=${visibleSlots.join(',')}');
+    // ignore: avoid_print
+    print('EXIT ANIM flyingImageUrl present ${url.isNotEmpty}');
+    // ignore: avoid_print
+    print('EXIT ANIM targetPreviewUrl present ${targetPreviewUrl.isNotEmpty}');
 
     return Scaffold(
       backgroundColor: const Color(0xFF070A16),
